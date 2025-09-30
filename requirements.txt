@@ -1,0 +1,28 @@
+# OS Log Monitor Requirements
+
+# Core Dependencies for Dataset Creation:
+pandas>=1.3.0
+openpyxl>=3.0.0
+
+# Built-in Python modules used:
+# - platform: for OS detection
+# - subprocess: for running system commands
+# - threading: for background processes
+# - signal: for graceful shutdown
+# - datetime: for timestamps
+# - typing: for type hints
+# - json: for data parsing
+# - csv: for data export
+# - dataclasses: for structured data
+# - collections: for data analysis
+
+# System Requirements:
+# - Python 3.7+ (required for dataclasses)
+# - Administrative privileges may be required for some log access
+# - Platform-specific tools:
+#   * Windows: PowerShell (built-in)
+#   * Linux: journalctl or tail (built-in)
+#   * macOS: log command (built-in)
+
+# Installation:
+# pip install pandas openpyxl

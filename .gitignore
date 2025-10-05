@@ -1,0 +1,40 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Generated analysis files
+*.json
+*.png
+*.jpg
+*.jpeg
+
+# Dataset files (keep sample but ignore large datasets)
+os_logs_dataset_*.xlsx
+!os_logs_dataset_sample.xlsx
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Logs
+*.log

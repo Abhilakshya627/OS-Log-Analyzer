@@ -1,22 +1,23 @@
-# OS Log Monitor with Excel Dataset Export
+# OS Log Analyzer - Complete System Log Monitoring Tool
 
-A comprehensive cross-platform Python application that detects your operating system, monitors system logs in real-time, and creates structured Excel datasets for log analysis.
+A comprehensive cross-platform Python application that combines real-time system log monitoring, dataset collection, and analysis capabilities into a single modular tool. Features both interactive and command-line interfaces for system log analysis across Windows, Linux, and macOS platforms.
 
 ## Features
 
-- **Automatic OS Detection**: Identifies Windows, Linux, or macOS
-- **Real-time Log Monitoring**: Continuously displays system logs as they're generated
-- **Excel Dataset Export**: Collects logs and exports to structured Excel files with analysis
-- **Cross-platform Support**: Works on Windows, Linux, and macOS with platform-specific optimizations
-- **Multiple Collection Modes**: Quick tests, timed collection, or continuous monitoring
-- **Data Analysis**: Built-in statistics, distributions, and trend analysis
-- **Graceful Shutdown**: Clean exit with Ctrl+C and automatic dataset export
+- **🔄 Real-time Log Monitoring**: Continuously displays system logs as they're generated
+- **📊 Dataset Collection & Analysis**: Collects logs and exports to structured Excel files with comprehensive analysis
+- **🖥️ Interactive Launcher**: User-friendly menu-driven interface for all operations
+- **⚡ Command-Line Interface**: Direct access to all features via CLI arguments
+- **🔍 Cross-platform Support**: Works on Windows, Linux, and macOS with platform-specific optimizations
+- **📈 Built-in Analysis**: Statistics, distributions, trend analysis, and visualizations
+- **🛡️ Graceful Shutdown**: Clean exit with Ctrl+C and automatic dataset export
+- **🧪 Demo & Test Modes**: Safe exploration with demo modes and timed tests
 
 ## Supported Operating Systems
 
 ### Windows
 - Uses PowerShell to access Windows Event Logs
-- Monitors both System and Application event logs
+- Monitors both System and Application event logs  
 - Falls back to polling method if real-time monitoring fails
 
 ### Linux
@@ -52,40 +53,46 @@ pip install -r requirements.txt
 
 ## Usage
 
-### 🚀 Quick Start (Recommended)
+### 🚀 Quick Start (Interactive Mode)
 ```bash
-python enhanced_launcher.py
+python os_log_analyzer.py
 ```
-Interactive menu with all options including dataset collection.
+Launches an interactive menu with all available options.
 
-### 📊 Dataset Collection Options
+### 📊 Dataset Collection
 ```bash
-# 1-minute test collection
-python test_dataset.py
+# 5-minute dataset collection
+python os_log_analyzer.py --collect --duration 300
 
-# 2-minute demo collection  
-python demo_dataset.py
-
-# Custom duration collection
-python os_log_dataset.py --duration 300  # 5 minutes
+# 1-hour collection  
+python os_log_analyzer.py --collect --duration 3600
 
 # Continuous collection (until Ctrl+C)
-python os_log_dataset.py
+python os_log_analyzer.py --collect
+
+# Quiet mode (minimal output)
+python os_log_analyzer.py --collect --duration 600 --quiet
 ```
 
-### 🔍 Real-time Monitoring (Display Only)
+### 🔍 Real-time Monitoring
 ```bash
-# Standard monitoring
-python os_log_monitor.py
+# Real-time log monitoring
+python os_log_analyzer.py --monitor
 
-# Quick 30-second test
-python test_monitor.py
+# 30-second test
+python os_log_analyzer.py --test
 
 # Demo mode (no actual monitoring)
-python demo_monitor.py
+python os_log_analyzer.py --demo
+```
 
-# Windows batch file
-run_monitor.bat
+### 🧪 Testing & Demo Modes
+```bash
+# Quick dataset collection demo (2 minutes)
+python os_log_analyzer.py --dataset-demo
+
+# Dataset collection test (1 minute)
+python os_log_analyzer.py --dataset-test
 ```
 
 ## Sample Output
@@ -184,10 +191,50 @@ Press `Ctrl+C` to gracefully stop the log monitoring. In dataset collection mode
 
 ## Code Structure
 
-- `OSLogMonitor`: Main class handling OS detection and log monitoring
+The application is now consolidated into a single modular file (`os_log_analyzer.py`) with the following key components:
+
+### Core Classes
+- **`LogEntry`**: Data structure for individual log entries
+- **`LogDataset`**: Manages log data collection and analysis
+- **`OSLogMonitor`**: Core log monitoring functionality
+- **`EnhancedOSLogMonitor`**: Extended version with dataset collection
+- **`InteractiveLauncher`**: User-friendly interactive interface
+
+### Key Methods
 - `detect_os()`: Identifies the current operating system
 - `monitor_*_logs()`: Platform-specific log monitoring methods
+- `export_to_excel()`: Creates comprehensive Excel reports
 - `signal_handler()`: Handles graceful shutdown on interruption
+
+### Command Line Interface
+Full argument parsing with help system:
+```bash
+python os_log_analyzer.py --help
+```
+
+## Interactive Menu Options
+
+When run without arguments, the tool presents an interactive menu:
+
+1. **Real-time log monitoring** - Display-only monitoring
+2. **Quick 30-second test** - Short monitoring test
+3. **Show demo** - Safe demonstration mode
+4. **5-minute dataset collection** - Quick dataset creation
+5. **15-minute dataset collection** - Standard dataset
+6. **1-hour dataset collection** - Comprehensive dataset
+7. **Custom duration collection** - User-specified duration
+8. **Continuous collection** - Until manual stop
+9. **System information** - OS and system details
+10. **Dataset collection guide** - Help and documentation
+11. **Exit** - Quit the application
+
+## Benefits of the Combined Approach
+
+- **Simplified Deployment**: Single file with all functionality
+- **Consistent Interface**: Unified command structure across all features
+- **Reduced Complexity**: No need to remember multiple script names
+- **Better Maintenance**: Single codebase to update and maintain
+- **Enhanced Modularity**: Clear separation of concerns within one file
 
 ## License
 

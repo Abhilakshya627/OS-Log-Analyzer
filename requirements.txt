@@ -1,8 +1,13 @@
-# OS Log Monitor Requirements
+# OS Log Analyzer - Combined Tool Requirements
 
-# Core Dependencies for Dataset Creation:
+# Core Dependencies:
 pandas>=1.3.0
 openpyxl>=3.0.0
+
+# Machine Learning and Threat Analysis:
+scikit-learn>=1.0.0
+matplotlib>=3.3.0
+seaborn>=0.11.0
 
 # Built-in Python modules used:
 # - platform: for OS detection
@@ -15,6 +20,7 @@ openpyxl>=3.0.0
 # - csv: for data export
 # - dataclasses: for structured data
 # - collections: for data analysis
+# - argparse: for command line interface
 
 # System Requirements:
 # - Python 3.7+ (required for dataclasses)
@@ -26,3 +32,10 @@ openpyxl>=3.0.0
 
 # Installation:
 # pip install pandas openpyxl
+
+# Usage Examples:
+# python os_log_analyzer.py                          # Interactive launcher
+# python os_log_analyzer.py --monitor                # Real-time monitoring  
+# python os_log_analyzer.py --collect --duration 300 # Dataset collection
+# python os_log_analyzer.py --demo                   # Show demo
+# python os_log_analyzer.py --test                   # Quick test

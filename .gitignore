@@ -6,7 +6,8 @@ __pycache__/
 .Python
 
 # Generated analysis files
-*.json
+*_analysis_*.json
+*_report_*.json
 *.png
 *.jpg
 *.jpeg
@@ -15,11 +16,28 @@ __pycache__/
 os_logs_dataset_*.xlsx
 !os_logs_dataset_sample.xlsx
 
+# Export files
+exports/
+*.csv
+
+# Log files
+*.log
+
+# Frontend dependencies and build
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
 # IDE and editor files
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# OS files
+.DS_Store
+Thumbs.db
 *~
 
 # OS generated files

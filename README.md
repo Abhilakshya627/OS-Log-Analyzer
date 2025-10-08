@@ -411,7 +411,7 @@ npm test
 
 ## 📜 **License**
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is open source and build for the purpose of  learning. Feel free to take this as a base and improve upon it.
 
 ## 🙏 **Acknowledgments**
 

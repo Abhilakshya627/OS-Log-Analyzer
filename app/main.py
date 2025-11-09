@@ -1,637 +1,830 @@
 #!/usr/bin/env python3
-"""
-Simplified Flask Web Application for OS Log Analyzer
-===================================================
+"""Autonomous OS Log Analyzer Flask backend."""
 
-A streamlined Flask application that provides a web interface for the
-unified OS Log Analyzer, with simplified monitoring, threat detection,
-and machine learning analysis capabilities.
+from __future__ import annotations
 
-Features:
-- Real-time log monitoring with unified backend
-- Simplified threat detection and analysis
-- Machine learning anomaly detection
-- REST API endpoints with proper error handling
-- Export functionality with multiple formats
-- Clear user feedback for all operations
-
-Author: OS Log Analyzer - Simplified Flask Edition
-Date: October 8, 2025
-"""
-
-import sys
-import os
-import json
 import csv
+import json
+import os
+import sys
 import threading
 import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-# Add parent directory to path to import our modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-import pandas as pd
+from flask_sock import Sock
+from simple_websocket import ConnectionClosed
 
-# Import our unified analysis module  
+# Ensure project root is importable before bringing in internal modules
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(APP_DIR)
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
 try:
-    from unified_analyzer import UnifiedLogAnalyzer, quick_analysis, analyze_log_file
-    UNIFIED_ANALYZER_AVAILABLE = True
-except ImportError as e:
-    print(f"⚠️ Import warning: {e}")
-    UNIFIED_ANALYZER_AVAILABLE = False
+    import pandas as pd
+except ImportError:  # pragma: no cover - optional dependency
+    pd = None
 
-# Configuration
-class Config:
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'os-log-analyzer-secret-key'
-    DEBUG = os.environ.get('FLASK_DEBUG', 'True').lower() == 'true'
-    CORS_ORIGINS = ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:5000', 'http://127.0.0.1:5000']
-    LOG_UPDATE_INTERVAL = 3  # seconds
-    MAX_LOGS_DISPLAY = 1000
-    UPLOAD_FOLDER = 'uploads'
-    ALLOWED_EXTENSIONS = {'xlsx', 'csv', 'json'}
+from app.config import config
+from app.database import DatabaseManager
+from app.event_dispatcher import EventDispatcher
+from app.process_control import ProcessController
+from app.response_engine import ResponseEngine
+from unified_analyzer import (
+    MLAnomaly,
+    LogEntry,
+    ThreatIndicator,
+    UnifiedLogAnalyzer,
+    quick_analysis,
+)
 
-# Initialize Flask app
+
+def _resolve_path(path_value: str, fallback_dir: str) -> str:
+    return path_value if os.path.isabs(path_value) else os.path.join(fallback_dir, path_value)
+
+
+DATABASE_PATH = _resolve_path(config.database_path, ROOT_DIR)
+QUARANTINE_DIR = _resolve_path(config.quarantine_dir, ROOT_DIR)
+EXPORTS_DIR = os.path.join(ROOT_DIR, "exports")
+UPLOAD_DIR = _resolve_path(config.upload_folder, ROOT_DIR)
+
+os.makedirs(EXPORTS_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 app = Flask(__name__)
-app.config.from_object(Config)
-
-# Initialize extensions
-CORS(app, origins=app.config['CORS_ORIGINS'])
-
-# Global services
-unified_analyzer = None
-monitoring_active = False
-monitoring_thread = None
+app.config["SECRET_KEY"] = config.secret_key
+app.config["CORS_ORIGINS"] = config.cors_origins
+app.config["LOG_UPDATE_INTERVAL"] = config.log_update_interval
+app.config["MAX_LOGS_DISPLAY"] = config.max_logs_display
+app.config["UPLOAD_FOLDER"] = UPLOAD_DIR
 app_start_time = datetime.now()
-real_time_data = {
-    'logs': [],
-    'threats': [],
-    'anomalies': []
+
+CORS(app, origins=config.cors_origins)
+sock = Sock(app)
+
+db_manager = DatabaseManager(DATABASE_PATH)
+event_dispatcher = EventDispatcher()
+process_controller = ProcessController(db_manager, QUARANTINE_DIR)
+response_engine = ResponseEngine(db_manager, process_controller, event_dispatcher)
+
+unified_analyzer: Optional[UnifiedLogAnalyzer] = None
+monitoring_active = False
+monitoring_thread: Optional[threading.Thread] = None
+metrics_thread: Optional[threading.Thread] = None
+blacklist_thread: Optional[threading.Thread] = None
+heartbeat_thread: Optional[threading.Thread] = None
+shutdown_event = threading.Event()
+state_lock = threading.RLock()
+
+real_time_state: Dict[str, Any] = {
+    "logs": [],
+    "threats": [],
+    "anomalies": [],
+    "metrics": {},
+    "processes": [],
+    "blacklist": db_manager.fetch_blacklist(),
+    "rules": db_manager.fetch_rules(),
+    "incidents": [],
+    "alerts": [],
+    "log_total": 0,
 }
 
-# Initialize services
-def initialize_services():
-    """Initialize the unified analyzer service."""
-    global unified_analyzer
-    
+MIN_LOGS_PER_BURST = 15
+HEARTBEAT_INTERVAL = 10
+replay_cursor = 0
+
+
+def _current_log_total() -> int:
+    if unified_analyzer and getattr(unified_analyzer, "logs", None) is not None:
+        try:
+            return len(unified_analyzer.logs)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+    return int(real_time_state.get("log_total", len(real_time_state["logs"])))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _limit_list(items: List[Any], limit: int) -> List[Any]:
+    if limit <= 0:
+        return items
+    return items[-limit:]
+
+
+def _calculate_time_ago(ts: datetime | str | None) -> str:
     try:
-        if UNIFIED_ANALYZER_AVAILABLE:
-            unified_analyzer = UnifiedLogAnalyzer()
-            print("✅ Unified analyzer initialized successfully")
-            return True
-        else:
-            print("❌ Unified analyzer not available")
-            return False
-    except Exception as e:
-        print(f"❌ Error initializing services: {e}")
+        if ts is None:
+            return "Unknown"
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.now()
+        diff = now - ts
+        if diff.total_seconds() < 60:
+            return f"{int(diff.total_seconds())}s ago"
+        if diff.total_seconds() < 3600:
+            return f"{int(diff.total_seconds() / 60)}m ago"
+        if diff.total_seconds() < 86400:
+            return f"{int(diff.total_seconds() / 3600)}h ago"
+        return f"{int(diff.total_seconds() / 86400)}d ago"
+    except Exception:
+        return "Unknown"
+
+
+def _severity_color(level: str) -> str:
+    mapping = {
+        "CRITICAL": "#dc3545",
+        "ERROR": "#fd7e14",
+        "WARNING": "#ffc107",
+        "INFO": "#17a2b8",
+        "DEBUG": "#6c757d",
+        "VERBOSE": "#6f42c1",
+    }
+    return mapping.get(level.upper(), "#17a2b8")
+
+
+def _log_icon(log_type: str) -> str:
+    icons = {
+        "system": "⚙",
+        "application": "📱",
+        "security": "🔒",
+        "setup": "⚡",
+        "network": "🌐",
+        "service": "🔧",
+    }
+    return icons.get(log_type.lower(), "📄")
+
+
+def _log_to_dict(log: LogEntry) -> Dict[str, Any]:
+    log_id = f"{log.timestamp.isoformat()}-{log.event_id}-{log.source}"
+    is_recent = (datetime.now() - log.timestamp).total_seconds() <= 30
+    return {
+        "id": log_id,
+        "timestamp": log.timestamp.isoformat(),
+        "formatted_timestamp": log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        "time_ago": _calculate_time_ago(log.timestamp),
+        "os_type": log.os_type,
+        "log_type": log.log_type,
+        "source": log.source,
+        "event_id": log.event_id,
+        "level": log.level,
+        "message": log.message,
+        "full_message": log.message,
+        "raw_data": log.raw_data,
+        "severity_color": _severity_color(log.level),
+        "type_icon": _log_icon(log.log_type),
+        "is_recent": is_recent,
+    }
+
+
+def _ensure_minimum_real_logs(new_logs: List[LogEntry], minimum: int = MIN_LOGS_PER_BURST) -> List[Tuple[LogEntry, bool]]:
+    enriched: List[Tuple[LogEntry, bool]] = [(log, False) for log in new_logs]
+    if len(enriched) >= minimum:
+        return enriched
+
+    if not unified_analyzer or not unified_analyzer.logs:
+        return enriched
+
+    global replay_cursor
+    backlog = unified_analyzer.logs
+    needed = minimum - len(enriched)
+    if not backlog:
+        return enriched
+
+    for _ in range(needed):
+        entry = backlog[replay_cursor % len(backlog)]
+        replay_cursor += 1
+        enriched.append((entry, True))
+
+    return enriched
+
+
+def _threat_to_dict(threat: ThreatIndicator, log_dict: Dict[str, Any]) -> Dict[str, Any]:
+    first_seen = threat.first_seen or log_dict.get("timestamp")
+    last_seen = threat.last_seen or first_seen
+    if isinstance(first_seen, datetime):
+        first_seen_str = first_seen.isoformat()
+    elif isinstance(first_seen, str):
+        first_seen_str = first_seen
+    elif first_seen is None:
+        first_seen_str = log_dict.get("timestamp")
+    else:
+        first_seen_str = str(first_seen)
+
+    if isinstance(last_seen, datetime):
+        last_seen_str = last_seen.isoformat()
+    elif isinstance(last_seen, str):
+        last_seen_str = last_seen
+    elif last_seen is None:
+        last_seen_str = first_seen_str
+    else:
+        last_seen_str = str(last_seen)
+    return {
+        "id": f"threat_{len(real_time_state['threats']) + 1}_{int(time.time())}",
+        "threat_type": threat.threat_type,
+        "severity": threat.severity,
+        "confidence": threat.confidence,
+        "description": threat.description,
+        "source_ip": threat.source_ip,
+        "event_count": threat.event_count,
+        "first_seen": first_seen_str,
+        "last_seen": last_seen_str,
+        "log_reference": log_dict,
+    }
+
+
+def _anomaly_to_dict(anomaly: MLAnomaly) -> Dict[str, Any]:
+    return {
+        "timestamp": anomaly.timestamp.isoformat(),
+        "anomaly_score": anomaly.anomaly_score,
+        "description": anomaly.description,
+        "detection_method": anomaly.detection_method,
+        "log_entry": anomaly.log_entry,
+    }
+
+
+def _snapshot() -> Dict[str, Any]:
+    with state_lock:
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "monitoring_active": monitoring_active,
+            "logs": real_time_state["logs"][-200:],
+            "threats": real_time_state["threats"][-100:],
+            "anomalies": real_time_state["anomalies"][-100:],
+            "metrics": real_time_state["metrics"],
+            "processes": real_time_state["processes"][:50],
+            "blacklist": real_time_state["blacklist"],
+            "rules": real_time_state["rules"],
+            "incidents": real_time_state["incidents"][-50:],
+            "total_logs": _current_log_total(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Background services
+# ---------------------------------------------------------------------------
+
+
+def initialize_services() -> bool:
+    global unified_analyzer
+    try:
+        unified_analyzer = UnifiedLogAnalyzer()
+        unified_analyzer.display_logs = False
+        return True
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Error initializing analyzer: {exc}")
         return False
 
-def start_monitoring():
-    """Start real-time log monitoring in background thread."""
+
+def ensure_background_threads() -> None:
+    global metrics_thread, blacklist_thread, heartbeat_thread
+    if metrics_thread is None or not metrics_thread.is_alive():
+        metrics_thread = threading.Thread(target=_metrics_loop, daemon=True)
+        metrics_thread.start()
+    if blacklist_thread is None or not blacklist_thread.is_alive():
+        blacklist_thread = threading.Thread(target=_blacklist_loop, daemon=True)
+        blacklist_thread.start()
+    if heartbeat_thread is None or not heartbeat_thread.is_alive():
+        heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
+
+
+def start_monitoring() -> bool:
     global monitoring_active, monitoring_thread
-    
-    if not monitoring_active and unified_analyzer:
-        monitoring_active = True
-        monitoring_thread = threading.Thread(target=monitor_logs_background, daemon=True)
-        monitoring_thread.start()
-        print("🔄 Real-time monitoring started")
+    if unified_analyzer is None:
+        return False
+    if monitoring_active:
         return True
-    return False
+    monitoring_active = True
+    monitoring_thread = threading.Thread(target=_monitor_logs_loop, daemon=True)
+    monitoring_thread.start()
+    return True
 
-def stop_monitoring():
-    """Stop real-time log monitoring."""
+
+def stop_monitoring() -> bool:
     global monitoring_active
-    
-    if monitoring_active and unified_analyzer:
-        monitoring_active = False
+    if not monitoring_active:
+        return False
+    monitoring_active = False
+    if unified_analyzer:
         unified_analyzer.stop()
-        print("⏹️ Real-time monitoring stopped")
-        return True
-    return False
+    return True
 
-def monitor_logs_background():
-    """Background thread for real-time log monitoring using unified analyzer."""
-    global real_time_data, unified_analyzer
-    
-    if not unified_analyzer:
-        print("❌ Unified analyzer not initialized")
-        return
-    
-    print("🔄 Starting unified log collection...")
-    
-    # Set up the analyzer for background collection
-    unified_analyzer.display_logs = False  # Don't print to console
-    
-    while monitoring_active:
+
+def _monitor_logs_loop() -> None:
+    assert unified_analyzer is not None
+    while monitoring_active and not shutdown_event.is_set():
         try:
-            # Collect logs based on OS
-            if unified_analyzer.os_type == 'windows':
+            if unified_analyzer.os_type == "windows":
                 new_logs = unified_analyzer.collect_windows_logs()
-            elif unified_analyzer.os_type == 'linux':
+            elif unified_analyzer.os_type == "linux":
                 new_logs = unified_analyzer.collect_linux_logs()
             else:
                 new_logs = []
-            
-            # Update real-time data with new logs
-            for log in new_logs:
-                log_dict = {
-                    'id': f"{log.timestamp.isoformat()}-{log.event_id}",
-                    'timestamp': log.timestamp.isoformat(),
-                    'formatted_timestamp': log.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-                    'time_ago': calculate_time_ago(log.timestamp),
-                    'os_type': log.os_type,
-                    'log_type': log.log_type.capitalize(),
-                    'source': log.source,
-                    'event_id': log.event_id,
-                    'level': log.level.upper(),
-                    'message': log.message,
-                    'raw_data': log.raw_data,
-                    'severity_color': get_severity_color(log.level),
-                    'type_icon': get_log_type_icon(log.log_type),
-                    'is_recent': is_log_recent(log.timestamp)
-                }
-                
-                # Avoid duplicates
-                if log_dict not in real_time_data['logs']:
-                    real_time_data['logs'].append(log_dict)
-            
-            # Update threats and anomalies
-            real_time_data['threats'] = [
-                {
-                    'id': f'threat_{i}',
-                    'type': threat.threat_type,
-                    'severity': threat.severity,
-                    'confidence': threat.confidence,
-                    'description': threat.description,
-                    'timestamp': threat.first_seen.isoformat() if threat.first_seen else datetime.now().isoformat(),
-                    'source_ip': threat.source_ip
-                }
-                for i, threat in enumerate(unified_analyzer.threats)
-            ]
-            
-            real_time_data['anomalies'] = [
-                {
-                    'timestamp': anomaly.timestamp.isoformat(),
-                    'anomaly_score': anomaly.anomaly_score,
-                    'description': anomaly.description,
-                    'detection_method': anomaly.detection_method,
-                    'source': anomaly.log_entry.get('source', 'Unknown')
-                }
-                for anomaly in unified_analyzer.anomalies
-            ]
-            
-            # Keep only recent logs to prevent memory issues
-            if len(real_time_data['logs']) > app.config['MAX_LOGS_DISPLAY']:
-                real_time_data['logs'] = real_time_data['logs'][-app.config['MAX_LOGS_DISPLAY']:]
-                
-            time.sleep(app.config['LOG_UPDATE_INTERVAL'])
-            
-        except Exception as e:
-            print(f"Error in monitoring thread: {e}")
+
+            processed_logs = _ensure_minimum_real_logs(new_logs)
+            with state_lock:
+                existing_ids = {entry["id"] for entry in real_time_state["logs"]}
+
+            for log, replayed in processed_logs:
+                log_dict = _log_to_dict(log)
+                log_dict["received_at"] = datetime.now().isoformat()
+                original_id = log_dict["id"]
+                if replayed:
+                    replay_suffix = int(time.time() * 1000)
+                    log_dict["replayed"] = True
+                    log_dict["original_id"] = original_id
+                    log_dict["id"] = f"{original_id}-replay-{replay_suffix}"
+                with state_lock:
+                    if log_dict["id"] not in existing_ids:
+                        real_time_state["logs"].append(log_dict)
+                        real_time_state["logs"] = _limit_list(real_time_state["logs"], config.max_logs_display)
+                        if not replayed:
+                            real_time_state["log_total"] = _current_log_total()
+                        existing_ids.add(log_dict["id"])
+                    current_total = _current_log_total()
+                payload = dict(log_dict)
+                payload["collection_total"] = current_total
+                event_dispatcher.publish("log.new", payload)
+
+                if replayed:
+                    continue
+
+                threats = unified_analyzer.detect_threats(log)
+                for threat in threats:
+                    threat_dict = _threat_to_dict(threat, log_dict)
+                    with state_lock:
+                        real_time_state["threats"].append(threat_dict)
+                        real_time_state["threats"] = _limit_list(real_time_state["threats"], 500)
+                    event_dispatcher.publish("threat.detected", threat_dict)
+                    response_summary = response_engine.handle_threat(threat_dict, log_dict)
+                    with state_lock:
+                        real_time_state["incidents"].append(response_summary)
+                        real_time_state["alerts"].append({"threat": threat_dict, "response": response_summary})
+
+            with state_lock:
+                real_time_state["log_total"] = _current_log_total()
+
+            if len(unified_analyzer.logs) >= 10:
+                recent_logs = unified_analyzer.logs[-30:]
+                new_anomalies = unified_analyzer.detect_ml_anomalies(recent_logs)
+                if new_anomalies:
+                    anomaly_dicts = [_anomaly_to_dict(anomaly) for anomaly in new_anomalies]
+                    with state_lock:
+                        real_time_state["anomalies"].extend(anomaly_dicts)
+                        real_time_state["anomalies"] = _limit_list(real_time_state["anomalies"], 500)
+                    for anomaly in anomaly_dicts:
+                        event_dispatcher.publish("anomaly.detected", anomaly)
+
+            time.sleep(max(1, config.log_update_interval))
+        except Exception as exc:  # pylint: disable=broad-except
+            event_dispatcher.publish("monitoring.error", {"message": str(exc)})
             time.sleep(5)
 
-# Helper functions
-def calculate_time_ago(timestamp):
-    """Calculate human-readable time difference."""
-    try:
-        if isinstance(timestamp, str):
-            timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        
-        now = datetime.now(timestamp.tzinfo) if timestamp.tzinfo else datetime.now()
-        diff = now - timestamp
-        
-        if diff.total_seconds() < 60:
-            return f"{int(diff.total_seconds())}s ago"
-        elif diff.total_seconds() < 3600:
-            return f"{int(diff.total_seconds() / 60)}m ago"
-        elif diff.total_seconds() < 86400:
-            return f"{int(diff.total_seconds() / 3600)}h ago"
-        else:
-            return f"{int(diff.total_seconds() / 86400)}d ago"
-    except:
-        return "Unknown"
 
-def get_severity_color(level):
-    """Get color code for log level severity."""
-    level_colors = {
-        'CRITICAL': '#dc3545',  # Red
-        'ERROR': '#fd7e14',     # Orange
-        'WARNING': '#ffc107',   # Yellow
-        'INFO': '#17a2b8',      # Cyan
-        'DEBUG': '#6c757d',     # Gray
-        'VERBOSE': '#6f42c1'    # Purple
-    }
-    return level_colors.get(level.upper(), '#17a2b8')
+def _metrics_loop() -> None:
+    while not shutdown_event.is_set():
+        metrics = process_controller.collect_system_metrics()
+        processes = process_controller.list_processes(limit=200)
+        with state_lock:
+            real_time_state["metrics"] = metrics
+            real_time_state["processes"] = processes
+        event_dispatcher.publish("system.metrics", metrics)
+        time.sleep(max(2, config.metrics_poll_interval))
 
-def get_log_type_icon(log_type):
-    """Get icon for log type."""
-    type_icons = {
-        'system': '⚙️',
-        'application': '📱',
-        'security': '🔒',
-        'setup': '⚡',
-        'network': '🌐',
-        'service': '🔧',
-        'unknown': '📄'
-    }
-    return type_icons.get(log_type.lower(), '📄')
 
-def is_log_recent(timestamp):
-    """Check if log is from the last 30 seconds."""
-    try:
-        if isinstance(timestamp, str):
-            log_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        else:
-            log_time = timestamp
-        
-        now = datetime.now(log_time.tzinfo) if log_time.tzinfo else datetime.now()
-        return (now - log_time).total_seconds() <= 30
-    except:
-        return False
+def _blacklist_loop() -> None:
+    while not shutdown_event.is_set():
+        entries = db_manager.fetch_blacklist()
+        if entries:
+            results = process_controller.enforce_blacklist(entries)
+            if results:
+                event_dispatcher.publish("blacklist.enforced", {"results": results})
+        time.sleep(max(5, config.blacklist_enforcement_interval))
 
+
+def _heartbeat_loop() -> None:
+    while not shutdown_event.is_set():
+        event_dispatcher.publish(
+            "monitoring.heartbeat",
+            {"timestamp": datetime.now().isoformat(), "subscribers": event_dispatcher.subscriber_count()},
+        )
+        time.sleep(HEARTBEAT_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # API Routes
-@app.route('/')
-def index():
-    """API root endpoint."""
-    return jsonify({
-        'message': 'OS Log Analyzer API - Simplified Edition',
-        'frontend_url': 'http://localhost:3000',
-        'api_docs': '/api/',
-        'health': '/api/health',
-        'unified_analyzer': UNIFIED_ANALYZER_AVAILABLE
-    })
+# ---------------------------------------------------------------------------
 
-@app.route('/api/system/status')
-def system_status():
-    """Get current system and monitoring status."""
-    uptime = (datetime.now() - app_start_time).total_seconds()
-    
-    logs_count = len(real_time_data['logs']) if real_time_data['logs'] else 0
-    real_logs_collected = len(unified_analyzer.logs) if unified_analyzer else 0
-    
-    status = {
-        'timestamp': datetime.now().isoformat(),
-        'monitoring_active': monitoring_active,
-        'os_type': unified_analyzer.os_type if unified_analyzer else ('windows' if os.name == 'nt' else 'linux'),
-        'system_info': {
-            'platform': os.name,
-            'python_version': sys.version
-        },
-        'total_logs': logs_count,
-        'real_logs_collected': real_logs_collected,
-        'using_unified_analyzer': unified_analyzer is not None,
-        'uptime_seconds': uptime,
-        'services': {
-            'unified_analyzer': unified_analyzer is not None,
-            'monitoring_thread': monitoring_thread is not None and monitoring_thread.is_alive() if monitoring_thread else False
+
+@app.route("/")
+def index() -> Any:
+    return jsonify(
+        {
+            "message": "OS Log Analyzer API",
+            "version": "3.0",
+            "websocket": "/api/ws/stream",
+            "health": "/api/health",
         }
-    }
-    return jsonify(status)
+    )
 
-@app.route('/api/logs/live')
-def logs_live():
-    """Get recent real logs for real-time display."""
-    try:
-        limit = request.args.get('limit', 100, type=int)
-        
-        # Get logs in chronological order (most recent last)
-        logs = real_time_data['logs'][-limit:] if real_time_data['logs'] else []
-        
-        return jsonify({
-            'timestamp': datetime.now().isoformat(),
-            'total': len(real_time_data['logs']),
-            'returned': len(logs),
-            'logs': logs,
-            'monitoring_active': monitoring_active,
-            'using_unified_analyzer': unified_analyzer is not None,
-            'last_update': datetime.now().isoformat()
-        })
-    except Exception as e:
-        return jsonify({'error': f'Failed to get live logs: {str(e)}'}), 500
 
-@app.route('/api/threats/active')
-def threats_active():
-    """Get currently active threats."""
-    try:
-        threats = real_time_data.get('threats', [])
-        
-        return jsonify({
-            'timestamp': datetime.now().isoformat(),
-            'active_threats': len(threats),
-            'threats': threats
-        })
-    except Exception as e:
-        return jsonify({'error': f'Failed to get threats: {str(e)}'}), 500
+@app.route("/api/system/status")
+def system_status() -> Any:
+    uptime = (datetime.now() - app_start_time).total_seconds()
+    with state_lock:
+        logs_count = _current_log_total()
+        threat_count = len(real_time_state["threats"])
+        anomaly_count = len(real_time_state["anomalies"])
+        metrics = real_time_state["metrics"]
+    return jsonify(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "monitoring_active": monitoring_active,
+            "uptime_seconds": uptime,
+            "os_type": unified_analyzer.os_type if unified_analyzer else os.name,
+            "logs_collected": logs_count,
+            "threats_detected": threat_count,
+            "anomalies_found": anomaly_count,
+            "metrics": metrics,
+            "services": {
+                "unified_analyzer": unified_analyzer is not None,
+                "monitoring_thread": monitoring_thread.is_alive() if monitoring_thread else False,
+                "metrics_thread": metrics_thread.is_alive() if metrics_thread else False,
+                "blacklist_thread": blacklist_thread.is_alive() if blacklist_thread else False,
+            },
+        }
+    )
 
-@app.route('/api/threats/analyze', methods=['POST'])
-def threats_analyze():
-    """Analyze specific log entries for threats."""
-    try:
-        data = request.get_json()
-        
-        if not data or 'logs' not in data:
-            return jsonify({'error': 'No log data provided'}), 400
-        
-        if not unified_analyzer:
-            return jsonify({'error': 'Unified analyzer not initialized'}), 500
-        
-        results = []
-        for log_data in data['logs']:
-            # Convert dict back to LogEntry for analysis
-            from unified_analyzer import LogEntry
-            log_entry = LogEntry(
-                timestamp=datetime.fromisoformat(log_data['timestamp'].replace('Z', '+00:00')),
-                os_type=log_data.get('os_type', 'unknown'),
-                log_type=log_data.get('log_type', 'unknown'),
-                source=log_data.get('source', 'unknown'),
-                event_id=log_data.get('event_id', ''),
-                level=log_data.get('level', 'INFO'),
-                message=log_data.get('message', ''),
-                raw_data=log_data.get('raw_data', '')
+
+@app.route("/api/system/metrics")
+def system_metrics() -> Any:
+    with state_lock:
+        metrics = real_time_state["metrics"]
+        processes = real_time_state["processes"][:100]
+    return jsonify(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "metrics": metrics,
+            "processes": processes,
+        }
+    )
+
+
+@app.route("/api/logs/live")
+def logs_live() -> Any:
+    limit = request.args.get("limit", 100, type=int)
+    with state_lock:
+        logs = real_time_state["logs"][-max(1, min(limit, 1000)) :]
+        total = _current_log_total()
+        for entry in logs:
+            entry.setdefault("received_at", entry.get("timestamp"))
+    return jsonify(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "total": total,
+            "returned": len(logs),
+            "logs": logs,
+            "monitoring_active": monitoring_active,
+        }
+    )
+
+
+@app.route("/api/threats/active")
+def threats_active() -> Any:
+    with state_lock:
+        threats = real_time_state["threats"][-200:]
+    return jsonify(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "active_threats": len(threats),
+            "threats": threats,
+        }
+    )
+
+
+@app.route("/api/threats/analyze", methods=["POST"])
+def threats_analyze() -> Any:
+    data = request.get_json() or {}
+    logs = data.get("logs", [])
+    if unified_analyzer is None:
+        return jsonify({"error": "Analyzer not initialized"}), 500
+    results: List[Dict[str, Any]] = []
+    for log in logs:
+        try:
+            entry = LogEntry(
+                timestamp=datetime.fromisoformat(log["timestamp"].replace("Z", "+00:00")),
+                os_type=log.get("os_type", "unknown"),
+                log_type=log.get("log_type", "unknown"),
+                source=log.get("source", "unknown"),
+                event_id=log.get("event_id", ""),
+                level=log.get("level", "INFO"),
+                message=log.get("message", ""),
+                raw_data=log.get("raw_data", ""),
             )
-            
-            threats = unified_analyzer.detect_threats(log_entry)
-            for threat in threats:
-                results.append({
-                    'log_entry': log_data,
-                    'threat_type': threat.threat_type,
-                    'severity': threat.severity,
-                    'confidence': threat.confidence,
-                    'description': threat.description
-                })
-        
-        return jsonify({
-            'timestamp': datetime.now().isoformat(),
-            'analyzed_logs': len(data['logs']),
-            'threats_found': len(results),
-            'results': results
-        })
-    except Exception as e:
-        return jsonify({'error': f'Threat analysis failed: {str(e)}'}), 500
+        except Exception as exc:  # pylint: disable=broad-except
+            results.append({"error": str(exc), "log": log})
+            continue
+        for threat in unified_analyzer.detect_threats(entry):
+            threat_dict = _threat_to_dict(threat, log)
+            results.append(threat_dict)
+    return jsonify(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "analyzed_logs": len(logs),
+            "threats_found": len(results),
+            "results": results,
+        }
+    )
 
-@app.route('/api/ml/anomalies')
-def ml_anomalies():
-    """Get detected anomalies from ML analysis."""
-    try:
-        anomalies = real_time_data.get('anomalies', [])
-        
-        # If we have recent logs but no anomalies, try to run ML analysis
-        if not anomalies and unified_analyzer and len(unified_analyzer.logs) > 10:
-            recent_logs = unified_analyzer.logs[-20:]
-            unified_analyzer.detect_ml_anomalies(recent_logs)
-            
-            # Update real-time data
-            anomalies = [
-                {
-                    'timestamp': anomaly.timestamp.isoformat(),
-                    'anomaly_score': anomaly.anomaly_score,
-                    'description': anomaly.description,
-                    'detection_method': anomaly.detection_method,
-                    'source': anomaly.log_entry.get('source', 'Unknown')
-                }
-                for anomaly in unified_analyzer.anomalies
-            ]
-            real_time_data['anomalies'] = anomalies
-        
-        return jsonify({
-            'timestamp': datetime.now().isoformat(),
-            'total_logs_analyzed': len(unified_analyzer.logs) if unified_analyzer else 0,
-            'anomalies_detected': len(anomalies),
-            'anomaly_rate': len(anomalies) / len(unified_analyzer.logs) * 100 if unified_analyzer and unified_analyzer.logs else 0,
-            'anomalies': anomalies,
-            'ml_available': unified_analyzer is not None and hasattr(unified_analyzer, 'ml_model') and unified_analyzer.ml_model is not None
-        })
-    except Exception as e:
-        return jsonify({'error': f'ML analysis failed: {str(e)}'}), 500
 
-@app.route('/api/export/logs/<format>')
-def export_logs(format):
-    """Export logs in specified format."""
-    try:
-        if format not in ['json', 'csv', 'xlsx']:
-            return jsonify({'error': 'Unsupported format. Use json, csv, or xlsx'}), 400
-        
-        if not unified_analyzer or not unified_analyzer.logs:
-            return jsonify({'error': 'No logs available for export'}), 400
-        
-        # Create exports directory
-        os.makedirs('exports', exist_ok=True)
-        
-        if format == 'xlsx':
-            filename = unified_analyzer.export_to_excel()
-            return send_from_directory('exports' if os.path.exists(os.path.join('exports', filename)) else '.', filename, as_attachment=True)
-        
-        elif format == 'json':
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f'unified_logs_export_{timestamp}.json'
-            filepath = os.path.join('exports', filename)
-            
-            # Convert logs to JSON-serializable format
-            logs_data = []
+@app.route("/api/ml/anomalies")
+def ml_anomalies() -> Any:
+    with state_lock:
+        anomalies = real_time_state["anomalies"][-200:]
+    return jsonify(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "anomalies": anomalies,
+            "total_logs_analyzed": len(unified_analyzer.logs) if unified_analyzer else 0,
+        }
+    )
+
+
+@app.route("/api/processes")
+def list_processes() -> Any:
+    limit = request.args.get("limit", 200, type=int)
+    processes = process_controller.list_processes(limit=max(10, min(limit, 500)))
+    return jsonify({"timestamp": datetime.now().isoformat(), "processes": processes})
+
+
+@app.route("/api/processes/<int:pid>/action", methods=["POST"])
+def process_action(pid: int) -> Any:
+    payload = request.get_json() or {}
+    action = payload.get("action")
+    reason = payload.get("reason")
+    if action not in {"kill", "quarantine", "blacklist"}:
+        return jsonify({"error": "Unsupported action"}), 400
+    if action == "kill":
+        result = process_controller.terminate_process(pid, reason=reason)
+    elif action == "quarantine":
+        result = process_controller.quarantine_process(pid, reason=reason)
+    else:
+        hash_value = process_controller.process_hash(pid)
+        if hash_value:
+            db_manager.add_blacklist_entry(hash_value, "hash", reason or "manual")
+        result = process_controller.terminate_process(pid, reason="blacklist")
+    event_dispatcher.publish("process.action", {"pid": pid, "action": action, "result": result})
+    return jsonify({"timestamp": datetime.now().isoformat(), "result": result})
+
+
+@app.route("/api/blacklist", methods=["GET", "POST"])
+def blacklist() -> Any:
+    if request.method == "GET":
+        entries = db_manager.fetch_blacklist()
+        return jsonify({"timestamp": datetime.now().isoformat(), "blacklist": entries})
+    payload = request.get_json() or {}
+    identifier = payload.get("identifier")
+    entry_type = payload.get("type", "process")
+    if not identifier:
+        return jsonify({"error": "identifier is required"}), 400
+    entry_id = db_manager.add_blacklist_entry(
+        identifier=identifier,
+        entry_type=entry_type,
+        reason=payload.get("reason"),
+        expires_at=payload.get("expires_at"),
+        metadata=payload.get("metadata"),
+    )
+    with state_lock:
+        real_time_state["blacklist"] = db_manager.fetch_blacklist()
+    event_dispatcher.publish("blacklist.added", {"entry_id": entry_id, "identifier": identifier})
+    return jsonify({"entry_id": entry_id, "status": "added"}), 201
+
+
+@app.route("/api/blacklist/<path:identifier>", methods=["DELETE"])
+def blacklist_remove(identifier: str) -> Any:
+    db_manager.remove_blacklist_identifier(identifier)
+    with state_lock:
+        real_time_state["blacklist"] = db_manager.fetch_blacklist()
+    event_dispatcher.publish("blacklist.removed", {"identifier": identifier})
+    return jsonify({"status": "removed"})
+
+
+@app.route("/api/blacklist/enforce", methods=["POST"])
+def blacklist_enforce() -> Any:
+    entries = db_manager.fetch_blacklist()
+    results = process_controller.enforce_blacklist(entries)
+    payload = {
+        "timestamp": datetime.now().isoformat(),
+        "results": results,
+        "count": len(results),
+    }
+    event_dispatcher.publish("blacklist.enforced", payload)
+    return jsonify(payload)
+
+
+@app.route("/api/rules", methods=["GET", "POST"])
+def rules() -> Any:
+    if request.method == "GET":
+        ruleset = db_manager.fetch_rules()
+        return jsonify({"rules": ruleset})
+    payload = request.get_json() or {}
+    if not payload.get("name") or not payload.get("pattern"):
+        return jsonify({"error": "name and pattern are required"}), 400
+    rule_id = db_manager.upsert_rule(payload)
+    with state_lock:
+        real_time_state["rules"] = db_manager.fetch_rules()
+    event_dispatcher.publish("rule.created", {"rule_id": rule_id})
+    return jsonify({"rule_id": rule_id, "status": "created"}), 201
+
+
+@app.route("/api/rules/<int:rule_id>", methods=["PATCH", "DELETE"])
+def rule_detail(rule_id: int) -> Any:
+    if request.method == "PATCH":
+        payload = request.get_json() or {}
+        db_manager.update_rule(rule_id, payload)
+        with state_lock:
+            real_time_state["rules"] = db_manager.fetch_rules()
+        event_dispatcher.publish("rule.updated", {"rule_id": rule_id})
+        return jsonify({"status": "updated"})
+    db_manager.delete_rule(rule_id)
+    with state_lock:
+        real_time_state["rules"] = db_manager.fetch_rules()
+    event_dispatcher.publish("rule.deleted", {"rule_id": rule_id})
+    return jsonify({"status": "deleted"})
+
+
+@app.route("/api/incidents", methods=["GET"])
+def incidents() -> Any:
+    incidents_list = db_manager.fetch_incidents()
+    return jsonify({"incidents": incidents_list})
+
+
+@app.route("/api/incidents/<int:incident_id>", methods=["PATCH"])
+def update_incident(incident_id: int) -> Any:
+    payload = request.get_json() or {}
+    db_manager.update_incident(incident_id, payload)
+    event_dispatcher.publish("incident.updated", {"incident_id": incident_id, "payload": payload})
+    return jsonify({"status": "updated"})
+
+
+@app.route("/api/audit/logs")
+def audit_logs() -> Any:
+    logs = db_manager.fetch_audit_logs(limit=200)
+    return jsonify({"audit_logs": logs})
+
+
+@app.route("/api/export/logs/<format>")
+def export_logs(format: str) -> Any:
+    if unified_analyzer is None or not unified_analyzer.logs:
+        return jsonify({"error": "No logs available"}), 400
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if format == "json":
+        filename = f"logs_{timestamp}.json"
+        filepath = os.path.join(EXPORTS_DIR, filename)
+        with open(filepath, "w", encoding="utf-8") as handle:
+            json.dump([_log_to_dict(log) for log in unified_analyzer.logs], handle, indent=2)
+        return send_from_directory(EXPORTS_DIR, filename, as_attachment=True)
+    if format == "csv":
+        filename = f"logs_{timestamp}.csv"
+        filepath = os.path.join(EXPORTS_DIR, filename)
+        with open(filepath, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["Timestamp", "OS", "Type", "Source", "Event", "Level", "Message"])
             for log in unified_analyzer.logs:
-                logs_data.append({
-                    'timestamp': log.timestamp.isoformat(),
-                    'os_type': log.os_type,
-                    'log_type': log.log_type,
-                    'source': log.source,
-                    'event_id': log.event_id,
-                    'level': log.level,
-                    'message': log.message,
-                    'raw_data': log.raw_data
-                })
-            
-            with open(filepath, 'w') as f:
-                json.dump({
-                    'export_timestamp': datetime.now().isoformat(),
-                    'total_logs': len(logs_data),
-                    'logs': logs_data
-                }, f, indent=2)
-            
-            return send_from_directory('exports', filename, as_attachment=True)
-        
-        elif format == 'csv':
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f'unified_logs_export_{timestamp}.csv'
-            filepath = os.path.join('exports', filename)
-            
-            # Create CSV
-            with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['Timestamp', 'OS_Type', 'Log_Type', 'Source', 'Event_ID', 'Level', 'Message'])
-                
-                for log in unified_analyzer.logs:
-                    writer.writerow([
+                writer.writerow(
+                    [
                         log.timestamp.isoformat(),
                         log.os_type,
                         log.log_type,
                         log.source,
                         log.event_id,
                         log.level,
-                        log.message[:500]  # Truncate long messages
-                    ])
-            
-            return send_from_directory('exports', filename, as_attachment=True)
-    
-    except Exception as e:
-        return jsonify({'error': f'Export failed: {str(e)}'}), 500
+                        log.message[:500],
+                    ]
+                )
+        return send_from_directory(EXPORTS_DIR, filename, as_attachment=True)
+    if format == "xlsx":
+        if pd is None:
+            return jsonify({"error": "pandas is required for xlsx export"}), 400
+        filename = unified_analyzer.export_to_excel(directory=EXPORTS_DIR)
+        return send_from_directory(EXPORTS_DIR, filename, as_attachment=True)
+    return jsonify({"error": "Unsupported format"}), 400
 
-@app.route('/api/monitoring/start', methods=['POST'])
-def start_monitoring_endpoint():
-    """Start real-time monitoring."""
-    try:
-        success = start_monitoring()
-        if success:
-            return jsonify({
-                'message': 'Monitoring started successfully',
-                'timestamp': datetime.now().isoformat(),
-                'status': 'active'
-            })
-        else:
-            return jsonify({
-                'error': 'Failed to start monitoring - analyzer not available',
-                'timestamp': datetime.now().isoformat(),
-                'status': 'failed'
-            }), 500
-    except Exception as e:
-        return jsonify({
-            'error': f'Failed to start monitoring: {str(e)}',
-            'timestamp': datetime.now().isoformat(),
-            'status': 'error'
-        }), 500
 
-@app.route('/api/monitoring/stop', methods=['POST'])
-def stop_monitoring_endpoint():
-    """Stop real-time monitoring."""
-    try:
-        success = stop_monitoring()
-        return jsonify({
-            'message': 'Monitoring stopped' if success else 'Monitoring was not active',
-            'timestamp': datetime.now().isoformat(),
-            'status': 'inactive'
-        })
-    except Exception as e:
-        return jsonify({
-            'error': f'Failed to stop monitoring: {str(e)}',
-            'timestamp': datetime.now().isoformat(),
-            'status': 'error'
-        }), 500
+@app.route("/api/monitoring/start", methods=["POST"])
+def monitoring_start() -> Any:
+    if unified_analyzer is None:
+        return jsonify({"error": "Analyzer unavailable"}), 500
+    started = start_monitoring()
+    event_dispatcher.publish("monitoring.state", {"active": started})
+    return jsonify({"status": "active" if started else "already"})
 
-@app.route('/api/analysis/comprehensive', methods=['POST'])
-def comprehensive_analysis_endpoint():
-    """Run comprehensive analysis on current log data."""
-    try:
-        if not unified_analyzer:
-            return jsonify({'error': 'Unified analyzer not initialized'}), 500
-        
-        # Get comprehensive summary
-        summary = unified_analyzer.get_summary()
-        
-        return jsonify({
-            'timestamp': datetime.now().isoformat(),
-            'analysis_results': summary,
-            'logs_analyzed': len(unified_analyzer.logs)
-        })
-    except Exception as e:
-        return jsonify({'error': f'Comprehensive analysis failed: {str(e)}'}), 500
 
-@app.route('/api/analysis/quick', methods=['POST'])
-def quick_analysis_endpoint():
-    """Run a quick analysis for a specified duration."""
-    try:
-        data = request.get_json() or {}
-        duration = data.get('duration', 30)  # Default 30 seconds
-        
-        if not UNIFIED_ANALYZER_AVAILABLE:
-            return jsonify({'error': 'Unified analyzer not available'}), 500
-        
-        # Run quick analysis in background thread to avoid blocking
-        def run_analysis():
-            return quick_analysis(duration)
-        
-        # For now, run synchronously (in production, consider async handling)
-        results = run_analysis()
-        
-        return jsonify({
-            'timestamp': datetime.now().isoformat(),
-            'duration': duration,
-            'results': results
-        })
-    except Exception as e:
-        return jsonify({'error': f'Quick analysis failed: {str(e)}'}), 500
+@app.route("/api/monitoring/stop", methods=["POST"])
+def monitoring_stop() -> Any:
+    stopped = stop_monitoring()
+    event_dispatcher.publish("monitoring.state", {"active": not stopped})
+    return jsonify({"status": "inactive" if stopped else "already"})
 
-# Health check endpoint
-@app.route('/api/health')
-def health_check():
-    """Health check endpoint with detailed status."""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'uptime': (datetime.now() - app_start_time).total_seconds(),
-        'version': '2.0.0-simplified',
-        'services': {
-            'unified_analyzer': unified_analyzer is not None,
-            'monitoring': monitoring_active,
-            'logs_collected': len(unified_analyzer.logs) if unified_analyzer else 0,
-            'threats_detected': len(unified_analyzer.threats) if unified_analyzer else 0,
-            'anomalies_found': len(unified_analyzer.anomalies) if unified_analyzer else 0
+
+@app.route("/api/analysis/comprehensive", methods=["POST"])
+def analysis_comprehensive() -> Any:
+    if unified_analyzer is None:
+        return jsonify({"error": "Analyzer unavailable"}), 500
+    summary = unified_analyzer.get_summary()
+    return jsonify({"timestamp": datetime.now().isoformat(), "analysis_results": summary})
+
+
+@app.route("/api/analysis/quick", methods=["POST"])
+def analysis_quick() -> Any:
+    payload = request.get_json() or {}
+    duration = int(payload.get("duration", 30))
+    result = quick_analysis(duration)
+    return jsonify({"timestamp": datetime.now().isoformat(), "duration": duration, "results": result})
+
+
+@app.route("/api/health")
+def health() -> Any:
+    return jsonify(
+        {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "uptime": (datetime.now() - app_start_time).total_seconds(),
+            "monitoring_active": monitoring_active,
+            "logs_collected": len(unified_analyzer.logs) if unified_analyzer else 0,
+            "threats_detected": len(unified_analyzer.threats) if unified_analyzer else 0,
         }
-    })
+    )
 
-# Error Handlers with detailed feedback
+
 @app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        'error': 'Endpoint not found',
-        'message': 'The requested API endpoint does not exist',
-        'available_endpoints': [
-            '/api/health',
-            '/api/system/status',
-            '/api/logs/live',
-            '/api/threats/active',
-            '/api/ml/anomalies',
-            '/api/monitoring/start',
-            '/api/monitoring/stop',
-            '/api/export/logs/<format>'
-        ]
-    }), 404
+def not_found(_: Exception) -> Any:  # pylint: disable=unused-argument
+    return (
+        jsonify(
+            {
+                "error": "Endpoint not found",
+                "available": [
+                    "/api/health",
+                    "/api/system/status",
+                    "/api/logs/live",
+                    "/api/threats/active",
+                    "/api/system/metrics",
+                ],
+            }
+        ),
+        404,
+    )
+
 
 @app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        'error': 'Internal server error',
-        'message': 'An unexpected error occurred. Please check the server logs for details.',
-        'timestamp': datetime.now().isoformat()
-    }), 500
-
-# Application startup
-if __name__ == '__main__':
-    print("🚀 Starting OS Log Analyzer - Simplified Flask API")
-    print("=" * 60)
-    
-    # Initialize services
-    if initialize_services():
-        print("✅ All services initialized successfully")
-    else:
-        print("⚠️ Some services failed to initialize, continuing with limited functionality")
-    
-    # Create necessary directories
-    os.makedirs('exports', exist_ok=True)
-    
-    print(f"🔗 API endpoints available at: http://localhost:5000/api/")
-    print(f"🌐 React frontend should be running at: http://localhost:3000")
-    print(f"🔧 Health check: http://localhost:5000/api/health")
-    print("=" * 60)
-    
-    # Start monitoring automatically if analyzer is available
-    if unified_analyzer:
-        start_monitoring()
-        print("✅ Automatic monitoring started")
-    
-    # Run the Flask app
-    app.run(
-        host='0.0.0.0', 
-        port=5000, 
-        debug=app.config['DEBUG']
+def internal_error(_: Exception) -> Any:  # pylint: disable=unused-argument
+    return (
+        jsonify(
+            {
+                "error": "Internal server error",
+                "timestamp": datetime.now().isoformat(),
+            }
+        ),
+        500,
     )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket streaming
+# ---------------------------------------------------------------------------
+
+
+@sock.route("/api/ws/stream")
+def ws_stream(ws):  # type: ignore[override]
+    subscription = event_dispatcher.subscribe()
+    try:
+        ws.send(json.dumps({"type": "snapshot", "payload": _snapshot()}))
+        while True:
+            event = subscription.get()
+            ws.send(json.dumps(event))
+    except ConnectionClosed:
+        pass
+    finally:
+        event_dispatcher.unsubscribe(subscription)
+
+
+# ---------------------------------------------------------------------------
+# Application startup
+# ---------------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    print("Starting OS Log Analyzer backend...")
+    if initialize_services():
+        ensure_background_threads()
+        start_monitoring()
+    else:
+        print("Failed to initialize analyzer; running in limited mode")
+    ensure_background_threads()
+    app.run(host="0.0.0.0", port=5000, debug=config.debug, use_reloader=False)

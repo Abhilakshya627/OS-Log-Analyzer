@@ -30,7 +30,8 @@ import csv
 import re
 import ipaddress
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Set, Tuple
+from typing import Optional, List, Dict, Any, Set, Tuple, cast
+import numpy as np
 from dataclasses import dataclass, field
 from collections import defaultdict, Counter
 import warnings
@@ -56,6 +57,13 @@ try:
     HAS_ML = True
 except ImportError:
     HAS_ML = False
+    IsolationForest = None  # type: ignore[assignment]
+    OneClassSVM = None  # type: ignore[assignment]
+    KMeans = None  # type: ignore[assignment]
+    DBSCAN = None  # type: ignore[assignment]
+    StandardScaler = None  # type: ignore[assignment]
+    LabelEncoder = None  # type: ignore[assignment]
+    TfidfVectorizer = None  # type: ignore[assignment]
     print("Warning: scikit-learn not installed. ML analysis will be limited.")
 
 
@@ -191,9 +199,14 @@ class UnifiedLogAnalyzer:
     def _initialize_ml_components(self):
         """Initialize machine learning components."""
         try:
-            self.ml_scaler = StandardScaler()
-            self.ml_model = IsolationForest(contamination=0.1, random_state=42)
-            self.text_vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
+            if StandardScaler is None or IsolationForest is None or TfidfVectorizer is None:
+                raise RuntimeError("ML components are unavailable")
+            scaler_cls = cast(Any, StandardScaler)
+            model_cls = cast(Any, IsolationForest)
+            vectorizer_cls = cast(Any, TfidfVectorizer)
+            self.ml_scaler = scaler_cls()
+            self.ml_model = model_cls(contamination=0.1, random_state=42)
+            self.text_vectorizer = vectorizer_cls(max_features=100, stop_words='english')
         except Exception as e:
             print(f"ML initialization warning: {e}")
             self.ml_scaler = None
@@ -573,7 +586,7 @@ class UnifiedLogAnalyzer:
             anomalies.extend(self._detect_temporal_anomalies(logs))
             
             # 4. Advanced ML Analysis (if available)
-            if HAS_ML and self.ml_model:
+            if HAS_ML and self.ml_model is not None:
                 anomalies.extend(self._detect_ml_advanced_anomalies(logs))
             
         except Exception as e:
@@ -766,14 +779,16 @@ class UnifiedLogAnalyzer:
     
     def _detect_ml_advanced_anomalies(self, logs: List[LogEntry]) -> List[MLAnomaly]:
         """Advanced ML-based anomaly detection."""
-        if not HAS_ML or not self.ml_model:
+        if not HAS_ML or self.ml_model is None or self.ml_scaler is None:
             return []
         
-        anomalies = []
+        anomalies: List[MLAnomaly] = []
         
         try:
+            assert self.ml_model is not None
+            assert self.ml_scaler is not None
             # Prepare enhanced feature vectors
-            data = []
+            data: List[List[float]] = []
             for log in logs:
                 features = [
                     len(log.message),                          # Message length
@@ -787,11 +802,12 @@ class UnifiedLogAnalyzer:
                     len(re.findall(r'[A-Z]', log.message)),  # Uppercase count
                     1 if any(word in log.message.lower() for word in ['failed', 'error', 'denied']) else 0  # Threat keywords
                 ]
-                data.append(features)
+                data.append([float(value) for value in features])
             
             if len(data) >= 5:
                 # Scale features
-                scaled_data = self.ml_scaler.fit_transform(data)
+                data_array = np.asarray(data, dtype=float)
+                scaled_data = self.ml_scaler.fit_transform(data_array)
                 
                 # Train and predict
                 predictions = self.ml_model.fit_predict(scaled_data)
@@ -911,14 +927,21 @@ class UnifiedLogAnalyzer:
             }
         }
     
-    def export_to_excel(self, filename: Optional[str] = None) -> str:
+    def export_to_excel(self, filename: Optional[str] = None, directory: Optional[str] = None) -> str:
         """Export all collected data to Excel file."""
-        if not HAS_PANDAS:
-            raise Exception("pandas not available for Excel export")
+        if not HAS_PANDAS or pd is None:
+            raise RuntimeError("pandas not available for Excel export")
+        assert pd is not None
         
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"unified_log_analysis_{timestamp}.xlsx"
+
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+            filepath = os.path.join(directory, filename)
+        else:
+            filepath = filename
         
         try:
             # Prepare logs data
@@ -960,7 +983,7 @@ class UnifiedLogAnalyzer:
                 })
             
             # Create Excel file
-            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
                 # Raw logs
                 if logs_data:
                     pd.DataFrame(logs_data).to_excel(writer, sheet_name='Raw_Logs', index=False)
@@ -985,8 +1008,9 @@ class UnifiedLogAnalyzer:
                 
                 pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
             
-            print(f"📊 Analysis exported to: {filename}")
-            return filename
+            output_name = os.path.basename(filepath)
+            print(f"📊 Analysis exported to: {output_name}")
+            return output_name
         
         except Exception as e:
             print(f"❌ Export failed: {e}")
@@ -1022,7 +1046,8 @@ def analyze_log_file(file_path: str) -> Dict[str, Any]:
     
     try:
         # Load and analyze file (simplified)
-        if file_path.endswith('.xlsx') and HAS_PANDAS:
+        if file_path.endswith('.xlsx') and HAS_PANDAS and pd is not None:
+            assert pd is not None
             df = pd.read_excel(file_path)
             
             # Convert DataFrame to LogEntry objects

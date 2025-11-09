@@ -11,6 +11,10 @@ const LogStream = ({
   const logStreamRef = useRef(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [selectedLog, setSelectedLog] = useState(null);
+  const normalizedStatus = (connectionStatus || '').toLowerCase();
+  const connectionClass = ['connected', 'live', 'idle'].includes(normalizedStatus) ? 'connected' : 'disconnected';
+  const connectionIcon = connectionClass === 'connected' ? '🟢' : '🔴';
+  const totalAvailable = typeof allLogsCount === 'number' ? allLogsCount : logs.length;
 
   useEffect(() => {
     // Auto-scroll to bottom when new logs are added (if enabled)
@@ -73,8 +77,8 @@ const LogStream = ({
         <div className="logs-title">
           <h2>📝 Live Log Stream</h2>
           <div className="logs-status">
-            <span className={`connection-status ${connectionStatus.toLowerCase()}`}>
-              {connectionStatus} {connectionStatus === 'Connected' ? '🟢' : '🔴'}
+            <span className={`connection-status ${connectionClass}`}>
+              {connectionStatus} {connectionIcon}
             </span>
             {lastUpdateTime && (
               <span className="last-update">Last update: {lastUpdateTime}</span>
@@ -98,7 +102,7 @@ const LogStream = ({
             {isExpanded ? "🔼 Collapse" : "🔽 Expand"} 
           </button>
           <span className="log-count">
-            Showing: {logs.length} / Total: {allLogsCount}
+            Showing: {logs.length} / Total: {totalAvailable}
           </span>
         </div>
       </div>
@@ -126,12 +130,14 @@ const LogStream = ({
               {logs.map((log, index) => {
                 const isSelected = selectedLog?.id === log.id;
                 const isRecent = log.is_recent;
+                const isReplayed = Boolean(log.replayed);
                 
                 return (
                   <React.Fragment key={log.id || `${log.timestamp}-${index}`}>
                     <tr 
-                      className={`log-row ${isRecent ? 'recent' : ''} ${isSelected ? 'selected' : ''}`}
+                      className={`log-row ${isRecent ? 'recent' : ''} ${isSelected ? 'selected' : ''} ${isReplayed ? 'replayed' : ''}`}
                       onClick={() => handleLogClick(log)}
+                      title={isReplayed ? 'Replayed from historical backlog to maintain cadence' : undefined}
                     >
                       <td className="timestamp-cell">
                         <div className="timestamp-container">
@@ -169,6 +175,9 @@ const LogStream = ({
                       <td className="message-cell">
                         <div className="message-container">
                           <span className="message-text">{log.message}</span>
+                          {isReplayed && (
+                            <span className="replayed-badge" title="Historical log replayed for live stream cadence">Replayed</span>
+                          )}
                           {log.has_rulesengine && (
                             <span className="rulesengine-indicator" title="Contains RulesEngine info">
                               🔧
@@ -185,6 +194,11 @@ const LogStream = ({
                             <div className="detail-section">
                               <strong>Full Timestamp:</strong> {formatTimestamp(log.timestamp)}
                             </div>
+                            {isReplayed && (
+                              <div className="detail-section">
+                                <strong>Replay Source:</strong> {log.original_id || 'Historical backlog'}
+                              </div>
+                            )}
                             <div className="detail-section">
                               <strong>Full Message:</strong>
                               <div className="full-message">{log.full_message || log.message}</div>

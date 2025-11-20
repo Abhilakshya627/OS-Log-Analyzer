@@ -1,0 +1,73 @@
+Role Ownership Map
+===================
+
+Role: Platform Pipeline (Log Intake & Normalization)
+- Mission: maintain unified telemetry capture across Windows and Linux hosts.
+- Key responsibilities: configure OS detection defaults, collect and normalize event logs, manage real-time collection loops.
+- Primary code references:
+  - unified_analyzer.py L120-L266 – `UnifiedLogAnalyzer.__init__` establishes OS detection, storage buffers, and baseline threat data.
+  - unified_analyzer.py L269-L347 – `collect_windows_logs` pulls System/Application event channels via PowerShell and normalizes fields.
+  - unified_analyzer.py L350-L412 – `collect_linux_logs` ingests `journalctl` or `/var/log/syslog` entries with fallback parsing.
+  - unified_analyzer.py L881-L936 – `start_monitoring` drives the cross-platform polling loop and batching cadence.
+
+Role: Detection Engineering (Rules & Threat Heuristics)
+- Mission: deliver deterministic detections that feed automated response and reporting.
+- Key responsibilities: maintain baseline rule catalog, enrich heuristics, and surface justifications for analysts.
+- Primary code references:
+  - app/main.py L208-L287 – `_apply_detection_rules` loads DB-backed regex patterns, classifies matches, and triggers responses.
+  - unified_analyzer.py L413-L618 – `detect_threats` applies credential, process, malware, and IP heuristics with `reason` metadata.
+  - app/main.py L418-L510 – `_monitor_logs_loop` orchestrates live detection, merges replay safeguards, and emits threat payloads.
+  - app/database.py L62-L146 – `DatabaseManager.record_alert`, `fetch_recent_alerts`, and rule helpers persist match context.
+
+Role: Data Science & Anomaly Analytics
+- Mission: provide statistical and ML-based anomaly scoring that complements rule outcomes.
+- Key responsibilities: maintain hybrid analysis stack, feature pipelines, and fallback rule generation.
+- Primary code references:
+  - unified_analyzer.py L610-L720 – `detect_ml_anomalies` coordinates statistical, pattern, temporal, and ML routines.
+  - unified_analyzer.py L724-L843 – `_detect_statistical_anomalies` and `_detect_pattern_anomalies` compute message and source deviations.
+  - unified_analyzer.py L843-L914 – `_detect_temporal_anomalies` and `_detect_ml_advanced_anomalies` handle off-hours spikes and Isolation Forest scoring.
+  - unified_analyzer.py L720-L769 – `_generate_rule_based_anomalies` supplies deterministic fallbacks when data is sparse.
+
+Role: Response Automation & Enforcement
+- Mission: translate detections into auditable containment actions.
+- Key responsibilities: terminate malicious processes, enforce blacklist policy, block hostile IPs, and capture audit trails.
+- Primary code references:
+  - app/response_engine.py L1-L188 – `ResponseEngine.handle_threat` determines severity-driven actions, handles IP blocking, and records incidents.
+  - app/process_control.py L1-L214 – `ProcessController` enumerates processes, performs terminations/quarantine, and enforces blacklist identifiers.
+  - app/main.py L418-L510 – `_monitor_logs_loop` invokes `response_engine.handle_threat` and appends incident summaries to shared state.
+  - app/main.py L512-L575 – `_metrics_loop` & `_blacklist_loop` schedule ongoing blacklist enforcement and metrics refreshes.
+
+Role: Service Orchestration & API Platform
+- Mission: expose analyzer capabilities through resilient REST/WebSocket services and background schedulers.
+- Key responsibilities: initialize shared state, coordinate threads, serve API routes, and stream live updates to clients.
+- Primary code references:
+  - app/main.py L1-L196 – application bootstrap, dependency wiring, and shared state initialization.
+  - app/main.py L396-L575 – monitoring/metrics/blacklist thread management (`start_monitoring`, `_monitor_logs_loop`, `_metrics_loop`, `_heartbeat_loop`).
+  - app/main.py L620-L938 – REST endpoints for status, logs, threats, metrics, exports, incidents, rules, blacklist, and audit trails.
+  - app/main.py L989-L1013 – `ws_stream` WebSocket handler broadcasts snapshots and incremental events.
+  - run_simplified.py L1-L212 – CLI runner that launches coordinated frontend/backends for local ops.
+
+Role: Frontend Experience & Telemetry UX
+- Mission: deliver operator workflows for monitoring, response, and governance with resilient data plumbing.
+- Key responsibilities: manage websocket/API lifecycles, render dashboards, execute user-triggered actions, and surface notifications.
+- Primary code references:
+  - frontend/src/App.jsx L1-L399 – state initialization, notification helpers, and Axios error handling wrappers.
+  - frontend/src/App.jsx L400-L799 – WebSocket message routing, action handlers (process control, blacklist, rules, incidents), and button state orchestration.
+  - frontend/src/App.jsx L800-L1039 – connection lifecycle management, periodic refresh intervals, and component composition/rendering.
+  - frontend/src/services/api.js L1-L236 – Axios client setup, interceptors, and typed helper methods for backend endpoints.
+  - frontend/src/components/MonitoringControls.jsx L1-L137 – control surface for start/stop, analysis triggers, and export actions.
+  - frontend/src/components/ThreatAlerts.jsx & MLAnomalies.jsx (L1-L220/L1-L279) – severity-aware alert/anomaly rendering (UI team owns ongoing styling).
+
+Role: Persistence, Reporting & Governance
+- Mission: safeguard historical telemetry, policy, and auditability across sessions.
+- Key responsibilities: maintain SQLite schema, capture audit logs, supply exports, and support offline analysis flows.
+- Primary code references:
+  - app/database.py L1-L240 – `DatabaseManager` schema bootstrap plus alert/rule/blacklist/incident CRUD.
+  - unified_analyzer.py L969-L1058 – `export_to_excel` assembles logs, threats, anomalies, and summary sheets.
+  - unified_analyzer.py L1059-L1158 – CLI helpers (`quick_analysis`, `analyze_log_file`) enabling ad-hoc offline reviews and exports.
+  - exports/ README & generated XLSX (runtime) – storage location for generated reports governed by this role.
+
+Notes
+-----
+- Line ranges are based on main branch as of 2025-11-19; adjust if refactors shift boundaries.
+- Each role should update both code and this map when handing off responsibilities or altering major workflows.

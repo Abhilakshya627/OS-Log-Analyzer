@@ -96,6 +96,7 @@ class ThreatIndicator:
     first_seen: Optional[datetime] = None
     last_seen: Optional[datetime] = None
     raw_evidence: List[str] = field(default_factory=list)
+    reason: Optional[str] = None
 
 
 @dataclass
@@ -169,13 +170,26 @@ class UnifiedLogAnalyzer:
         self.threat_patterns = {
             'malware': ['virus', 'trojan', 'malware', 'worm', 'ransomware', 'backdoor', 'rootkit'],
             'network_attack': ['ddos', 'port scan', 'brute force', 'sql injection', 'xss', 'csrf'],
-            'privilege_escalation': ['privilege', 'escalation', 'elevated', 'runas', 'sudo'],
-            'data_exfiltration': ['upload', 'download', 'transfer', 'export', 'backup', 'copy'],
+            'privilege_escalation': ['privilege escalation', 'elevated privilege', 'runas', 'sudo'],
+            'data_exfiltration': [
+                'exfil',
+                'exfiltration',
+                'data leak',
+                'unauthorized transfer',
+                'data staging',
+                'large outbound transfer'
+            ],
             'suspicious_process': ['powershell', 'cmd.exe', 'sc.exe', 'net.exe', 'netsh', 'reg.exe'],
-            'persistence': ['scheduled task', 'registry', 'startup', 'service', 'autorun']
+            'persistence': [
+                'autorun entry',
+                'run registry key',
+                'startup folder persistence',
+                'scheduled task created',
+                'service installed for persistence'
+            ]
         }
-        
-        # Process monitoring patterns
+
+        # Process monitoring patterns aligned with baseline heuristics
         self.suspicious_processes = {
             'powershell.exe', 'cmd.exe', 'wscript.exe', 'cscript.exe',
             'regsvr32.exe', 'rundll32.exe', 'schtasks.exe', 'at.exe',
@@ -397,27 +411,32 @@ class UnifiedLogAnalyzer:
         return collected_logs
     
     def detect_threats(self, log_entry: LogEntry) -> List[ThreatIndicator]:
-        """Detect security threats in a log entry."""
-        threats = []
+        """Detect security threats in a log entry using baseline heuristics."""
+        threats: List[ThreatIndicator] = []
         message_lower = log_entry.message.lower()
-        
+
         try:
-            # 1. Failed login attempts (enhanced)
-            if any(pattern in message_lower for pattern in ['failed', 'failure', 'denied', 'invalid']):
-                if any(login_pattern in message_lower for login_pattern in ['login', 'logon', 'authentication', 'credential']):
-                    severity = 'high' if 'multiple' in message_lower or 'repeated' in message_lower else 'medium'
-                    threats.append(ThreatIndicator(
-                        threat_type='Authentication Failure',
-                        severity=severity,
-                        confidence=0.85,
-                        description=f'Authentication failure detected: {log_entry.message[:100]}...',
-                        source_ip=self._extract_ip_from_message(log_entry.message),
-                        first_seen=log_entry.timestamp,
-                        last_seen=log_entry.timestamp,
-                        raw_evidence=[log_entry.message]
-                    ))
-            
-            # 2. Windows threat events (enhanced)
+            # 1. Failed login attempts
+            failure_terms = [term for term in ['failed', 'failure', 'denied', 'invalid'] if term in message_lower]
+            login_terms = [term for term in ['login', 'logon', 'authentication', 'credential'] if term in message_lower]
+            if failure_terms and login_terms:
+                severity = 'high' if any(term in message_lower for term in ['multiple', 'repeated']) else 'medium'
+                reason = (
+                    f"Matched failure terms ({', '.join(failure_terms)}) with login keywords ({', '.join(login_terms)})"
+                )
+                threats.append(ThreatIndicator(
+                    threat_type='Authentication Failure',
+                    severity=severity,
+                    confidence=0.85,
+                    description=f'Authentication failure detected: {log_entry.message[:100]}...',
+                    source_ip=self._extract_ip_from_message(log_entry.message),
+                    first_seen=log_entry.timestamp,
+                    last_seen=log_entry.timestamp,
+                    raw_evidence=[log_entry.message],
+                    reason=reason,
+                ))
+
+            # 2. Windows threat events
             if log_entry.os_type == 'windows' and log_entry.event_id.isdigit():
                 event_id = int(log_entry.event_id)
                 if event_id in self.windows_threat_events:
@@ -428,37 +447,49 @@ class UnifiedLogAnalyzer:
                         4740: 'medium',  # Account locked
                         5157: 'medium',  # Firewall blocked
                         7045: 'medium',  # Service installed
-                        4688: 'low'      # Process created
+                        4688: 'low',     # Process created
                     }
                     severity = severity_map.get(event_id, 'medium')
-                    
+                    description = self.windows_threat_events[event_id]
+                    reason = f"Windows Event {event_id} ({description}) matched threat watchlist"
                     threats.append(ThreatIndicator(
-                        threat_type=self.windows_threat_events[event_id],
+                        threat_type=description,
                         severity=severity,
                         confidence=0.9,
-                        description=f'Windows Event {event_id}: {self.windows_threat_events[event_id]} - {log_entry.message[:80]}...',
+                        description=f'Windows Event {event_id}: {description} - {log_entry.message[:80]}...',
                         first_seen=log_entry.timestamp,
                         last_seen=log_entry.timestamp,
-                        raw_evidence=[log_entry.raw_data]
+                        raw_evidence=[log_entry.raw_data],
+                        reason=reason,
                     ))
-            
-            # 3. Malware detection patterns
+
+            # 3. Malware and pattern-based detection
             for threat_type, patterns in self.threat_patterns.items():
-                if any(pattern in message_lower for pattern in patterns):
-                    severity = 'critical' if threat_type == 'malware' else 'high'
-                    threats.append(ThreatIndicator(
-                        threat_type=threat_type.title().replace('_', ' '),
-                        severity=severity,
-                        confidence=0.75,
-                        description=f'{threat_type.title()} indicators detected: {log_entry.message[:100]}...',
-                        first_seen=log_entry.timestamp,
-                        last_seen=log_entry.timestamp,
-                        raw_evidence=[log_entry.message]
-                    ))
-            
+                matched_patterns = [pattern for pattern in patterns if pattern in message_lower]
+                if not matched_patterns:
+                    continue
+
+                severity = 'critical' if threat_type == 'malware' else 'high'
+                formatted_type = threat_type.title().replace('_', ' ')
+                matched_preview = ', '.join(matched_patterns[:3])
+                if len(matched_patterns) > 3:
+                    matched_preview += f", +{len(matched_patterns) - 3} more"
+                reason = f"Matched keywords for {formatted_type}: {matched_preview}"
+                threats.append(ThreatIndicator(
+                    threat_type=formatted_type,
+                    severity=severity,
+                    confidence=0.75,
+                    description=f'{formatted_type} indicators detected: {log_entry.message[:100]}...',
+                    first_seen=log_entry.timestamp,
+                    last_seen=log_entry.timestamp,
+                    raw_evidence=[log_entry.message],
+                    reason=reason,
+                ))
+
             # 4. Suspicious process monitoring
             for process in self.suspicious_processes:
                 if process.lower() in message_lower:
+                    reason = f"Suspicious process keyword '{process}' found in log message"
                     threats.append(ThreatIndicator(
                         threat_type='Suspicious Process Activity',
                         severity='medium',
@@ -466,14 +497,15 @@ class UnifiedLogAnalyzer:
                         description=f'Suspicious process detected: {process} - {log_entry.message[:80]}...',
                         first_seen=log_entry.timestamp,
                         last_seen=log_entry.timestamp,
-                        raw_evidence=[log_entry.message]
+                        raw_evidence=[log_entry.message],
+                        reason=reason,
                     ))
-            
+
             # 5. Network-based threats
             ips = self._extract_ips_from_message(log_entry.message)
             for ip in ips:
-                # Check against banned IPs
                 if ip in self.banned_ips:
+                    reason = f"IP {ip} appears in banned list"
                     threats.append(ThreatIndicator(
                         threat_type='Malicious IP Communication',
                         severity='high',
@@ -482,11 +514,11 @@ class UnifiedLogAnalyzer:
                         source_ip=ip,
                         first_seen=log_entry.timestamp,
                         last_seen=log_entry.timestamp,
-                        raw_evidence=[log_entry.message]
+                        raw_evidence=[log_entry.message],
+                        reason=reason,
                     ))
-                
-                # Check for suspicious IP patterns
                 elif self._is_suspicious_ip(ip):
+                    reason = f"IP {ip} considered suspicious"
                     threats.append(ThreatIndicator(
                         threat_type='Suspicious Network Activity',
                         severity='medium',
@@ -495,12 +527,14 @@ class UnifiedLogAnalyzer:
                         source_ip=ip,
                         first_seen=log_entry.timestamp,
                         last_seen=log_entry.timestamp,
-                        raw_evidence=[log_entry.message]
+                        raw_evidence=[log_entry.message],
+                        reason=reason,
                     ))
-            
+
             # 6. Privilege escalation detection
             if any(priv_word in message_lower for priv_word in ['administrator', 'admin', 'root', 'elevated']):
                 if any(action in message_lower for action in ['granted', 'access', 'permission', 'privilege']):
+                    reason = "Privilege-related terms combined with access grant language"
                     threats.append(ThreatIndicator(
                         threat_type='Privilege Escalation Attempt',
                         severity='high',
@@ -508,13 +542,15 @@ class UnifiedLogAnalyzer:
                         description=f'Potential privilege escalation: {log_entry.message[:100]}...',
                         first_seen=log_entry.timestamp,
                         last_seen=log_entry.timestamp,
-                        raw_evidence=[log_entry.message]
+                        raw_evidence=[log_entry.message],
+                        reason=reason,
                     ))
-            
+
             # 7. Suspicious user account activity
             for account in self.suspicious_accounts:
                 if account in message_lower:
                     severity = 'high' if account in ['administrator', 'admin', 'root'] else 'medium'
+                    reason = f"Sensitive account keyword '{account}' referenced"
                     threats.append(ThreatIndicator(
                         threat_type='Suspicious Account Activity',
                         severity=severity,
@@ -522,12 +558,14 @@ class UnifiedLogAnalyzer:
                         description=f'Activity involving sensitive account "{account}": {log_entry.message[:80]}...',
                         first_seen=log_entry.timestamp,
                         last_seen=log_entry.timestamp,
-                        raw_evidence=[log_entry.message]
+                        raw_evidence=[log_entry.message],
+                        reason=reason,
                     ))
-            
+
             # 8. Error-based anomaly detection
             if log_entry.level in ['ERROR', 'CRITICAL']:
                 if any(error_pattern in message_lower for error_pattern in ['access denied', 'permission denied', 'unauthorized']):
+                    reason = "Error log with access denial terminology"
                     threats.append(ThreatIndicator(
                         threat_type='Access Control Violation',
                         severity='medium',
@@ -535,15 +573,16 @@ class UnifiedLogAnalyzer:
                         description=f'Access control violation: {log_entry.message[:100]}...',
                         first_seen=log_entry.timestamp,
                         last_seen=log_entry.timestamp,
-                        raw_evidence=[log_entry.message]
+                        raw_evidence=[log_entry.message],
+                        reason=reason,
                     ))
-        
+
         except Exception as e:
             print(f"Error in threat detection: {e}")
-        
-        # Add threats to main list
+
         self.threats.extend(threats)
         return threats
+
     
     def _extract_ip_from_message(self, message: str) -> Optional[str]:
         """Extract the first IP address from a message."""

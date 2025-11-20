@@ -1,19 +1,17 @@
 import React from 'react';
 
-const Header = ({ systemStatus, connectionStatus }) => {
+const Header = ({ systemStatus, connectionStatus, wsConnected }) => {
   return (
     <div className="header">
       <h1>🛡️ OS Log Analyzer Dashboard</h1>
-      <div className="status-indicator">
-        <div className="status-dot"></div>
-        <span>{systemStatus?.monitoring_active ? 'System Active' : 'System Inactive'}</span>
-      </div>
       
-      <div className={`connection-status ${connectionStatus === 'Connected' ? 'connected' : 'disconnected'}`}>
-        {connectionStatus}
+      <div className={`connection-status ${wsConnected ? 'connected' : 'disconnected'}`}>
+        {wsConnected ? 'Live Stream' : 'Stream Offline'}
       </div>
     </div>
   );
 };
+
+//Data Exfileration and Persistence Error
 
 export default Header;

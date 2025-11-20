@@ -1,9 +1,30 @@
 import axios from 'axios';
 
-// Create axios instance with base configuration
+const resolveBaseURL = () => {
+  const env = typeof import.meta !== 'undefined' ? import.meta.env : undefined;
+  const nodeEnv = typeof process !== 'undefined' ? process.env : undefined;
+  const isProduction = env?.PROD ?? (nodeEnv?.NODE_ENV === 'production');
+
+  if (isProduction) {
+    return '/api';
+  }
+
+  const explicit = env?.VITE_API_BASE_URL || nodeEnv?.REACT_APP_API_BASE_URL;
+  if (explicit) {
+    const normalized = explicit.endsWith('/api') ? explicit : `${explicit.replace(/\/$/, '')}/api`;
+    return normalized;
+  }
+
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    return `http://${window.location.hostname}:5000/api`;
+  }
+
+  return 'http://localhost:5000/api';
+};
+
 const api = axios.create({
-  baseURL: process.env.NODE_ENV === 'production' ? '/api' : 'http://localhost:5000/api',
-  timeout: 30000, // Increased timeout for longer operations
+  baseURL: resolveBaseURL(),
+  timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -232,6 +253,112 @@ export const apiService = {
     } catch (error) {
       throw new Error('Failed to fetch all data');
     }
+  },
+
+  // Metrics and processes
+  getSystemMetrics: () => handleApiCall(
+    () => api.get('/system/metrics'),
+    'fetch system metrics'
+  ),
+
+  getProcesses: (limit = 200) => {
+    const safeLimit = Math.max(10, Math.min(limit, 500));
+    return handleApiCall(
+      () => api.get(`/processes?limit=${safeLimit}`),
+      'fetch processes'
+    );
+  },
+
+  processAction: (pid, action, reason) => handleApiCall(
+    () => api.post(`/processes/${pid}/action`, { action, reason }),
+    `execute ${action} on process ${pid}`
+  ),
+
+  processGroupAction: (payload) => handleApiCall(
+    () => api.post('/process-groups/action', payload),
+    `execute ${payload?.action || 'action'} on process group`
+  ),
+
+  // Blacklist
+  getBlacklist: () => handleApiCall(
+    () => api.get('/blacklist'),
+    'fetch blacklist'
+  ),
+
+  addBlacklistEntry: (entry) => handleApiCall(
+    () => api.post('/blacklist', entry),
+    'add blacklist entry'
+  ),
+
+  removeBlacklistEntry: (identifier) => handleApiCall(
+    () => api.delete(`/blacklist/${encodeURIComponent(identifier)}`),
+    'remove blacklist entry'
+  ),
+
+  enforceBlacklist: () => handleApiCall(
+    () => api.post('/blacklist/enforce'),
+    'enforce blacklist'
+  ),
+
+  // Rules
+  getRules: () => handleApiCall(
+    () => api.get('/rules'),
+    'fetch detection rules'
+  ),
+
+  createRule: (rule) => handleApiCall(
+    () => api.post('/rules', rule),
+    'create detection rule'
+  ),
+
+  updateRule: (ruleId, updates) => handleApiCall(
+    () => api.patch(`/rules/${ruleId}`, updates),
+    'update detection rule'
+  ),
+
+  deleteRule: (ruleId) => handleApiCall(
+    () => api.delete(`/rules/${ruleId}`),
+    'delete detection rule'
+  ),
+
+  // Incidents and audit
+  getIncidents: () => handleApiCall(
+    () => api.get('/incidents'),
+    'fetch incidents'
+  ),
+
+  updateIncident: (incidentId, updates) => handleApiCall(
+    () => api.patch(`/incidents/${incidentId}`, updates),
+    'update incident'
+  ),
+
+  getAuditLogs: () => handleApiCall(
+    () => api.get('/audit/logs'),
+    'fetch audit logs'
+  ),
+
+  // WebSocket helper
+  connectWebSocket: () => {
+    const env = typeof import.meta !== 'undefined' ? import.meta.env : undefined;
+    const nodeEnv = typeof process !== 'undefined' ? process.env : undefined;
+    const isProduction = env?.PROD ?? (nodeEnv?.NODE_ENV === 'production');
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    let host = window.location.host;
+
+    if (!isProduction) {
+      try {
+        const base = api.defaults.baseURL;
+        if (base) {
+          const parsed = new URL(base, window.location.origin);
+          host = parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+        }
+      } catch (_error) {
+        host = `${window.location.hostname}:5000`;
+      }
+    }
+
+    const url = `${protocol}://${host.replace(/\/$/, '')}/api/ws/stream`;
+    return new WebSocket(url);
   }
 };
 

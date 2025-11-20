@@ -6,11 +6,12 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Pattern, Tuple
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -95,6 +96,9 @@ real_time_state: Dict[str, Any] = {
 MIN_LOGS_PER_BURST = 15
 HEARTBEAT_INTERVAL = 10
 replay_cursor = 0
+
+compiled_rules_lock = threading.Lock()
+compiled_rules: Dict[int, Pattern[str]] = {}
 
 
 def _current_log_total() -> int:
@@ -182,6 +186,99 @@ def _log_to_dict(log: LogEntry) -> Dict[str, Any]:
     }
 
 
+def _update_compiled_rules(rules: List[Dict[str, Any]]) -> None:
+    with compiled_rules_lock:
+        compiled_rules.clear()
+        for rule in rules:
+            rule_id_value = rule.get("id")
+            try:
+                rule_id = int(rule_id_value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            pattern = rule.get("pattern")
+            enabled = rule.get("enabled", 1)
+            if not pattern or not enabled:
+                continue
+            try:
+                compiled_rules[rule_id] = re.compile(str(pattern), re.IGNORECASE)
+            except re.error:
+                continue
+
+
+def _apply_detection_rules(log_dict: Dict[str, Any]) -> None:
+    message = (log_dict.get("full_message") or log_dict.get("message") or "")
+    raw_data = log_dict.get("raw_data") or ""
+    search_space = f"{message}\n{raw_data}"
+    if not search_space.strip():
+        return
+
+    with state_lock:
+        active_rules = [rule for rule in real_time_state["rules"] if rule.get("enabled", 1)]
+
+    if not active_rules:
+        return
+
+    with compiled_rules_lock:
+        patterns_snapshot = {rule_id: pattern for rule_id, pattern in compiled_rules.items()}
+
+    triggered_rules: List[Dict[str, Any]] = []
+    for rule in active_rules:
+        rule_id_value = rule.get("id")
+        try:
+            rule_id = int(rule_id_value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        pattern = patterns_snapshot.get(rule_id)
+        if pattern is None:
+            continue
+        try:
+            if not pattern.search(search_space):
+                continue
+        except re.error:
+            continue
+
+        triggered_rules.append(rule)
+        rule_name = rule.get("name") or f"Rule {rule_id}"
+        action = (rule.get("action") or "alert").lower()
+        severity = (rule.get("severity") or "medium").lower()
+        if action == "block" and severity not in {"high", "critical"}:
+            severity = "high"
+
+        threat_payload = {
+            "id": f"rule-{rule_id}-{log_dict.get('id')}",
+            "timestamp": datetime.now().isoformat(),
+            "threat_type": f"Rule Match: {rule_name}",
+            "severity": severity,
+            "confidence": 0.9 if action == "block" else 0.75,
+            "description": f"Detection rule '{rule_name}' matched log entry",
+            "rule_id": rule_id,
+            "rule_action": action,
+            "rule_pattern": rule.get("pattern"),
+            "log_reference": log_dict,
+            "source": log_dict.get("source"),
+        }
+
+        with state_lock:
+            real_time_state["threats"].append(threat_payload)
+            real_time_state["threats"] = _limit_list(real_time_state["threats"], 500)
+
+        event_dispatcher.publish("threat.detected", threat_payload)
+        response_engine.handle_threat(threat_payload, log_dict)
+
+    if triggered_rules:
+        event_dispatcher.publish(
+            "rules.triggered",
+            {
+                "timestamp": datetime.now().isoformat(),
+                "rules": [rule.get("id") for rule in triggered_rules],
+                "log": log_dict,
+            },
+        )
+
+
+_update_compiled_rules(real_time_state["rules"])
+
+
 def _ensure_minimum_real_logs(new_logs: List[LogEntry], minimum: int = MIN_LOGS_PER_BURST) -> List[Tuple[LogEntry, bool]]:
     enriched: List[Tuple[LogEntry, bool]] = [(log, False) for log in new_logs]
     if len(enriched) >= minimum:
@@ -234,6 +331,8 @@ def _threat_to_dict(threat: ThreatIndicator, log_dict: Dict[str, Any]) -> Dict[s
         "event_count": threat.event_count,
         "first_seen": first_seen_str,
         "last_seen": last_seen_str,
+        "reason": threat.reason,
+        "raw_evidence": threat.raw_evidence,
         "log_reference": log_dict,
     }
 
@@ -355,6 +454,8 @@ def _monitor_logs_loop() -> None:
                 if replayed:
                     continue
 
+                _apply_detection_rules(log_dict)
+
                 threats = unified_analyzer.detect_threats(log)
                 for threat in threats:
                     threat_dict = _threat_to_dict(threat, log_dict)
@@ -392,9 +493,26 @@ def _metrics_loop() -> None:
         metrics = process_controller.collect_system_metrics()
         processes = process_controller.list_processes(limit=200)
         with state_lock:
+            blacklist_snapshot = list(real_time_state["blacklist"])
+        with state_lock:
             real_time_state["metrics"] = metrics
             real_time_state["processes"] = processes
         event_dispatcher.publish("system.metrics", metrics)
+
+        if blacklist_snapshot:
+            results = process_controller.enforce_blacklist(blacklist_snapshot)
+            if results:
+                timestamp = datetime.now().isoformat()
+                event_dispatcher.publish(
+                    "blacklist.enforced",
+                    {"results": results, "timestamp": timestamp, "count": len(results)},
+                )
+                refreshed_processes = process_controller.list_processes(limit=200)
+                audit_entries = db_manager.fetch_audit_logs(limit=200)
+                with state_lock:
+                    real_time_state["processes"] = refreshed_processes
+                    real_time_state["audit_logs"] = audit_entries
+
         time.sleep(max(2, config.metrics_poll_interval))
 
 
@@ -563,6 +681,71 @@ def list_processes() -> Any:
     return jsonify({"timestamp": datetime.now().isoformat(), "processes": processes})
 
 
+@app.route("/api/process-groups/action", methods=["POST"])
+def process_group_action() -> Any:
+    payload = request.get_json() or {}
+    action = payload.get("action")
+    reason = payload.get("reason")
+    identifier = payload.get("identifier")
+    identifier_type = payload.get("identifier_type", "process")
+    raw_pids = payload.get("pids", [])
+    metadata = payload.get("metadata")
+
+    if action not in {"kill", "quarantine", "blacklist"}:
+        return jsonify({"error": "Unsupported action"}), 400
+    if not isinstance(raw_pids, list) or not raw_pids:
+        return jsonify({"error": "pids list is required"}), 400
+
+    normalized_pids: List[int] = []
+    for pid in raw_pids:
+        try:
+            normalized_pids.append(int(pid))
+        except (TypeError, ValueError):
+            continue
+    if not normalized_pids:
+        return jsonify({"error": "No valid process identifiers provided"}), 400
+
+    result: Dict[str, Any]
+    blacklist_entry_id: Optional[int] = None
+
+    if action == "kill":
+        result = process_controller.terminate_process_group(normalized_pids, reason=reason)
+    elif action == "quarantine":
+        result = process_controller.quarantine_process_group(normalized_pids, reason=reason)
+    else:
+        if not identifier:
+            return jsonify({"error": "identifier is required for blacklist action"}), 400
+        blacklist_entry_id = db_manager.add_blacklist_entry(
+            identifier=identifier,
+            entry_type=identifier_type,
+            reason=reason or "manual block",
+            metadata=metadata,
+        )
+        with state_lock:
+            real_time_state["blacklist"] = db_manager.fetch_blacklist()
+        result = process_controller.terminate_process_group(normalized_pids, reason="blacklist")
+        result["blacklist_entry_id"] = blacklist_entry_id
+        result["identifier"] = identifier
+        result["identifier_type"] = identifier_type
+
+    response_payload = {
+        "timestamp": datetime.now().isoformat(),
+        "action": action,
+        "identifier": identifier,
+        "identifier_type": identifier_type,
+        "pids": normalized_pids,
+        "reason": reason,
+        "result": result,
+    }
+
+    event_dispatcher.publish("process.action", response_payload)
+    event_dispatcher.publish("process_group.action", response_payload)
+    if action == "blacklist" and blacklist_entry_id is not None:
+        event_dispatcher.publish("blacklist.added", {"entry_id": blacklist_entry_id, "identifier": identifier})
+
+    return jsonify(response_payload)
+
+
 @app.route("/api/processes/<int:pid>/action", methods=["POST"])
 def process_action(pid: int) -> Any:
     payload = request.get_json() or {}
@@ -639,6 +822,7 @@ def rules() -> Any:
     rule_id = db_manager.upsert_rule(payload)
     with state_lock:
         real_time_state["rules"] = db_manager.fetch_rules()
+    _update_compiled_rules(real_time_state["rules"])
     event_dispatcher.publish("rule.created", {"rule_id": rule_id})
     return jsonify({"rule_id": rule_id, "status": "created"}), 201
 
@@ -650,11 +834,13 @@ def rule_detail(rule_id: int) -> Any:
         db_manager.update_rule(rule_id, payload)
         with state_lock:
             real_time_state["rules"] = db_manager.fetch_rules()
+        _update_compiled_rules(real_time_state["rules"])
         event_dispatcher.publish("rule.updated", {"rule_id": rule_id})
         return jsonify({"status": "updated"})
     db_manager.delete_rule(rule_id)
     with state_lock:
         real_time_state["rules"] = db_manager.fetch_rules()
+    _update_compiled_rules(real_time_state["rules"])
     event_dispatcher.publish("rule.deleted", {"rule_id": rule_id})
     return jsonify({"status": "deleted"})
 

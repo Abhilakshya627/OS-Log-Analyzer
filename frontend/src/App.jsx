@@ -46,6 +46,13 @@ function App() {
   const [auditLogs, setAuditLogs] = useState([]);
   const [wsConnected, setWsConnected] = useState(false);
   const wsRef = useRef(null);
+  const wsReconnectTimerRef = useRef(null);
+  const wsAttemptsRef = useRef(0);
+  const lastWsNotificationRef = useRef(0);
+  const lastNetworkErrorRef = useRef(0);
+  const isMountedRef = useRef(false);
+  const wsConnectedRef = useRef(false);
+  const apiFailureCountRef = useRef(0);
 
   // Add notification helper
   const addNotification = useCallback((message, type = 'info') => {
@@ -90,12 +97,55 @@ function App() {
   const withErrorHandling = useCallback((asyncFn, errorMessage) => {
     return async (...args) => {
       try {
-        return await asyncFn(...args);
+        const result = await asyncFn(...args);
+        apiFailureCountRef.current = 0;
+        setConnectionStatus(prev => {
+          if (wsConnectedRef.current) {
+            return ['Disconnected', 'Error', 'Degraded', 'Connecting...', 'Connected'].includes(prev)
+              ? 'Live'
+              : prev;
+          }
+          return ['Disconnected', 'Error', 'Degraded', 'Connecting...'].includes(prev) ? 'Connected' : prev;
+        });
+        return result;
       } catch (error) {
         console.error(errorMessage, error);
-        const message = error.response?.data?.error || error.message || errorMessage;
-        addNotification(`❌ ${message}`, 'error');
-        setConnectionStatus('Error');
+        apiFailureCountRef.current += 1;
+
+        const message = error.userMessage
+          || error.response?.data?.error
+          || error.message
+          || errorMessage;
+        const originalError = error.originalError || error;
+        const messageLower = (message || '').toLowerCase();
+        const now = Date.now();
+        const networkLikely = (
+          (originalError && originalError.request && !originalError.response)
+          || messageLower.includes('unable to connect')
+          || messageLower.includes('failed to fetch')
+          || messageLower.includes('network error')
+          || messageLower.includes('timeout')
+          || messageLower.includes('econnrefused')
+        );
+
+        const failureThreshold = 3;
+
+        if (networkLikely) {
+          if (!wsConnectedRef.current) {
+            setConnectionStatus('Disconnected');
+          } else if (apiFailureCountRef.current >= failureThreshold) {
+            setConnectionStatus('Degraded');
+          }
+          if (now - lastNetworkErrorRef.current > 15000) {
+            addNotification('⚠️ Unable to reach backend on port 5000. Retrying...', 'warning');
+            lastNetworkErrorRef.current = now;
+          }
+        } else {
+          addNotification(`❌ ${message}`, 'error');
+          if (apiFailureCountRef.current >= failureThreshold) {
+            setConnectionStatus(wsConnectedRef.current ? 'Degraded' : 'Error');
+          }
+        }
         throw error;
       }
     };
@@ -106,7 +156,6 @@ function App() {
     async () => {
       const response = await apiService.getSystemStatus();
       setSystemStatus(response.data);
-      setConnectionStatus('Connected');
       return response.data;
     },
     'Failed to fetch system status'
@@ -162,7 +211,6 @@ function App() {
         
         setLastUpdateTime(new Date().toLocaleTimeString());
       }
-      setConnectionStatus('Connected');
     },
     'Failed to fetch logs'
   ), [withErrorHandling, addNotification]);
@@ -319,6 +367,9 @@ function App() {
     try {
       const data = JSON.parse(event.data);
       const { type, payload } = data;
+      if (!isMountedRef.current) {
+        return;
+      }
       switch (type) {
         case 'snapshot':
           if (payload.logs) {
@@ -436,6 +487,26 @@ function App() {
     fetchIncidents,
     fetchAuditLogs
   ]);
+
+  const cleanupWebSocket = useCallback(() => {
+    if (wsReconnectTimerRef.current) {
+      clearTimeout(wsReconnectTimerRef.current);
+      wsReconnectTimerRef.current = null;
+    }
+    wsConnectedRef.current = false;
+    if (wsRef.current) {
+      try {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+        wsRef.current.close();
+      } catch (error) {
+        console.warn('WebSocket cleanup error', error);
+      }
+      wsRef.current = null;
+    }
+  }, []);
 
   // Refresh all data
   const refreshData = useCallback(async () => {
@@ -591,18 +662,57 @@ function App() {
     );
   };
 
-  const handleProcessAction = useCallback(async (pid, action, reason) => {
-    try {
-      const response = await apiService.processAction(pid, action, reason);
-      addNotification(`⚙️ ${action} executed for PID ${pid}`, 'success');
-      if (response.data?.result?.status === 'access_denied') {
-        addNotification('⚠️ Action denied. Try running the backend with elevated privileges.', 'warning');
-      }
-      await Promise.all([fetchProcesses(), fetchAuditLogs()]);
-    } catch (error) {
-      // Errors handled by interceptor
+  const handleProcessAction = useCallback(async (group, action, reason) => {
+    if (!group || !Array.isArray(group.pids) || group.pids.length === 0) {
+      addNotification('⚠️ Unable to locate running instances for the selected app.', 'warning');
+      return;
     }
-  }, [addNotification, fetchProcesses, fetchAuditLogs]);
+
+    const identifier = group.identifier || group.exe || group.name;
+    const identifierType = group.identifier_type || (group.exe ? 'path' : 'process');
+    const payload = {
+      action,
+      reason,
+      identifier,
+      identifier_type: identifierType,
+      pids: group.pids,
+      metadata: {
+        name: group.name,
+        exe: group.exe,
+        instances: group.instances,
+      },
+    };
+
+    const actionLabels = {
+      kill: 'Termination',
+      quarantine: 'Quarantine',
+      blacklist: 'Blacklist',
+    };
+
+    try {
+      const response = await apiService.processGroupAction(payload);
+      const result = response.data?.result || {};
+      const summary = result.summary || {};
+      const label = actionLabels[action] || action;
+      const instanceCount = group.instances || group.pids.length;
+      const targetName = group.display_name || group.name || identifier;
+      addNotification(`⚙️ ${label} executed for ${targetName} (${instanceCount} instance${instanceCount === 1 ? '' : 's'})`, 'success');
+
+      if (summary.access_denied) {
+        addNotification(`⚠️ ${summary.access_denied} instance(s) denied. Try running the backend with elevated privileges.`, 'warning');
+      }
+
+      const followUps = [fetchProcesses(), fetchAuditLogs()];
+      if (result.blacklist_entry_id) {
+        followUps.push(fetchBlacklist());
+        addNotification('🛡️ App added to the blacklist', 'info');
+      }
+
+      await Promise.all(followUps);
+    } catch (error) {
+      // Errors handled upstream
+    }
+  }, [addNotification, fetchProcesses, fetchAuditLogs, fetchBlacklist]);
 
   const handleAddBlacklistEntry = useCallback(async (entry) => {
     try {
@@ -692,29 +802,104 @@ function App() {
     refreshData();
   }, [refreshData]);
 
-  useEffect(() => {
+  const connectWebSocket = useCallback(() => {
+    cleanupWebSocket();
+    if (!isMountedRef.current) {
+      return null;
+    }
+
+    const clearReconnectTimer = () => {
+      if (wsReconnectTimerRef.current) {
+        clearTimeout(wsReconnectTimerRef.current);
+        wsReconnectTimerRef.current = null;
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (!isMountedRef.current) {
+        return;
+      }
+      const attempts = wsAttemptsRef.current;
+      const baseDelay = 500;
+      const maxDelay = 15000;
+      const jitter = Math.random() * 250;
+      const delay = Math.min(maxDelay, baseDelay * Math.pow(2, Math.min(attempts, 6))) + jitter;
+      clearReconnectTimer();
+      wsReconnectTimerRef.current = setTimeout(() => {
+        wsReconnectTimerRef.current = null;
+        connectWebSocket();
+      }, delay);
+    };
+
     const ws = apiService.connectWebSocket();
     wsRef.current = ws;
+
     ws.onopen = () => {
+      if (!isMountedRef.current || wsRef.current !== ws) {
+        return;
+      }
+      clearReconnectTimer();
+      wsAttemptsRef.current = 0;
+      wsConnectedRef.current = true;
+      apiFailureCountRef.current = 0;
       setWsConnected(true);
       setConnectionStatus('Live');
-      addNotification('🛰️ Live data stream connected', 'success');
+      const now = Date.now();
+      if (now - lastWsNotificationRef.current > 15000) {
+        addNotification('🛰️ Live data stream connected', 'success');
+        lastWsNotificationRef.current = now;
+      }
     };
+
     ws.onmessage = handleWebSocketMessage;
-    ws.onclose = () => {
+
+    ws.onclose = (event) => {
+      if (!isMountedRef.current || wsRef.current !== ws) {
+        return;
+      }
+      wsConnectedRef.current = false;
+      wsAttemptsRef.current += 1;
       setWsConnected(false);
       setConnectionStatus('Disconnected');
-      addNotification('⚠️ Live data stream disconnected', 'warning');
+      const now = Date.now();
+      if (!event.wasClean && now - lastWsNotificationRef.current > 15000) {
+        addNotification('⚠️ Live data stream disconnected. Retrying...', 'warning');
+        lastWsNotificationRef.current = now;
+      }
+      scheduleReconnect();
     };
+
     ws.onerror = (error) => {
       console.error('WebSocket error', error);
-      addNotification('⚠️ Live data stream error', 'error');
+      if (!isMountedRef.current || wsRef.current !== ws) {
+        return;
+      }
+      wsConnectedRef.current = false;
+      wsAttemptsRef.current += 1;
+      const now = Date.now();
+      if (now - lastWsNotificationRef.current > 15000) {
+        addNotification('⚠️ Live data stream error. Attempting to recover...', 'warning');
+        lastWsNotificationRef.current = now;
+      }
+      try {
+        ws.close();
+      } catch (closeError) {
+        console.warn('WebSocket close error', closeError);
+      }
+      scheduleReconnect();
     };
+
+    return ws;
+  }, [addNotification, cleanupWebSocket, handleWebSocketMessage]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    connectWebSocket();
     return () => {
-      ws.close();
-      wsRef.current = null;
+      isMountedRef.current = false;
+      cleanupWebSocket();
     };
-  }, [addNotification, handleWebSocketMessage]);
+  }, [connectWebSocket, cleanupWebSocket]);
 
   useEffect(() => {
     // Update display logs when allLogs or expansion state changes
@@ -753,7 +938,12 @@ function App() {
   }, [fetchLogs, fetchThreats, fetchProcesses, fetchMetrics, fetchBlacklist, fetchRules, fetchIncidents, fetchAuditLogs, updateStats]);
 
   return (
-    <div className="App">
+    <div style={{ 
+        display: 'flex', 
+        justifyContent: 'center', 
+        alignItems: 'center', 
+      }}> 
+      <div className="App">
       {/* Notifications */}
       <div className="notifications">
         {notifications.map(notification => (
@@ -841,6 +1031,8 @@ function App() {
         />
       </div>
     </div>
+    </div>
+    
   );
 }
 

@@ -11,10 +11,10 @@ const STATUS_META = {
 const STATUS_OPTIONS = Object.keys(STATUS_META);
 
 const QUICK_ACTIONS = [
-  { label: 'Acknowledge', target: 'investigating', appliesTo: ['open'] },
-  { label: 'Contain', target: 'contained', appliesTo: ['open', 'investigating'] },
-  { label: 'Resolve', target: 'resolved', appliesTo: ['open', 'investigating', 'contained'] },
-  { label: 'Close', target: 'closed', appliesTo: ['resolved'] }
+  { label: 'Acknowledge', target: 'investigating', appliesTo: ['open'], description: 'Mark the incident as being investigated.' },
+  { label: 'Contain', target: 'contained', appliesTo: ['open', 'investigating'], description: 'Flag that the threat has been contained and immediate risk is mitigated.' },
+  { label: 'Resolve', target: 'resolved', appliesTo: ['open', 'investigating', 'contained'], description: 'Confirm remediation is complete and the incident is resolved.' },
+  { label: 'Close', target: 'closed', appliesTo: ['resolved'], description: 'Archive the incident after validation and documentation.' }
 ];
 
 const formatDate = (value) => {
@@ -50,6 +50,13 @@ const IncidentCenter = ({ incidents, onUpdate }) => {
       <div className="card-header">
         <h2>📁 Incident Center</h2>
         <span className="badge badge-muted">{incidents.length} incidents</span>
+      </div>
+      <div className="incident-action-legend">
+        {QUICK_ACTIONS.map(action => (
+          <span key={action.target} className={`legend-item action-${action.target}`}>
+            <strong>{action.label}:</strong> {action.description}
+          </span>
+        ))}
       </div>
       <div className="table-wrapper small">
         <table className="data-table">
@@ -98,6 +105,7 @@ const IncidentCenter = ({ incidents, onUpdate }) => {
                           className={`incident-action-btn action-${action.target}`}
                           onClick={() => handleQuickAction(incident.id, action.target)}
                           disabled={currentStatus === action.target}
+                          title={action.description}
                         >
                           {action.label}
                         </button>

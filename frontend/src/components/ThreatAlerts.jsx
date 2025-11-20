@@ -115,6 +115,9 @@ const ThreatAlerts = ({ threats }) => {
                 {threat.target_system && (
                   <div>• Target: {threat.target_system}</div>
                 )}
+                {threat.reason && (
+                  <div>• Reason: {threat.reason}</div>
+                )}
                 {threat.last_seen && threat.first_seen !== threat.last_seen && (
                   <div>• Last seen: {formatTimestamp(threat.last_seen)}</div>
                 )}

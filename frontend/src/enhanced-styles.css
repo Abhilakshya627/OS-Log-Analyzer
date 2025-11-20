@@ -294,6 +294,19 @@
   grid-column: 1 / -1;
 }
 
+.incident-action-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 8px 0 12px;
+  font-size: 12px;
+  color: #495057;
+}
+
+.incident-action-legend .legend-item strong {
+  margin-right: 4px;
+}
+
 .metrics-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -348,6 +361,18 @@
 
 .card.process-card .table-wrapper.process-table {
   max-height: 460px;
+}
+
+.process-name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.process-name .process-subtitle {
+  font-size: 12px;
+  color: #6c757d;
+  word-break: break-all;
 }
 
 .data-table {
